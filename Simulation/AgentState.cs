@@ -1,6 +1,6 @@
 using Microsoft.Xna.Framework;
 
-namespace Seedfall.Simulation;
+namespace Hollowbound.Simulation;
 
 public sealed class AgentState
 {

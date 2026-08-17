@@ -5,10 +5,10 @@
     "version": "0.2.0",
     "configurations": [
       {
-        "name": "C#: Seedfall Debug",
+        "name": "C#: Hollowbound Debug",
         "type": "dotnet",
         "request": "launch",
-        "projectPath": "${workspaceFolder}/Seedfall.csproj"
+        "projectPath": "${workspaceFolder}/Hollowbound.csproj"
       }
     ],
   }

@@ -3,9 +3,9 @@ using System.Linq;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
 using Microsoft.Xna.Framework.Input;
-using Seedfall.Simulation;
+using Hollowbound.Simulation;
 
-namespace Seedfall;
+namespace Hollowbound;
 
 public sealed class Game1 : Game
 {
@@ -30,7 +30,7 @@ public sealed class Game1 : Game
         };
         Content.RootDirectory = "Content";
         IsMouseVisible = true;
-        Window.Title = "Seedfall";
+        Window.Title = "Hollowbound";
     }
 
     protected override void LoadContent()

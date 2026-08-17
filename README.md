@@ -1,6 +1,6 @@
-# Seedfall
+# Hollowbound
 
-Seedfall — это 2D idle simulation sandbox про маленькие абстрактные организмы-агенты, убежища, ресурсы, фракции и возникающее поведение.
+Hollowbound — это 2D idle simulation sandbox про маленькие абстрактные организмы-агенты, убежища, ресурсы, фракции и возникающее поведение.
 
 Это новая версия проекта. Старый 3D-эксперимент сохранён отдельно как [Seedfall Prototype](https://github.com/v1beinc/Seedfall-Prototype).
 
@@ -36,7 +36,7 @@ dotnet restore
 dotnet run
 ```
 
-В Visual Studio открой `Seedfall.sln` и запусти проект через `F5`.
+В Visual Studio открой `Hollowbound.sln` и запусти проект через `F5`.
 
 ## Архитектурное направление
 

@@ -1,2 +1,2 @@
-﻿using var game = new Seedfall.Game1();
+using var game = new Hollowbound.Game1();
 game.Run();
