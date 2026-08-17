@@ -12,12 +12,13 @@ public sealed class Game1 : Game
     private const float MinimumTileSize = 8f;
     private readonly GraphicsDeviceManager _graphics;
     private EmergentSimulationWorld _world = new(seed: Random.Shared.Next(1, int.MaxValue), initialPopulation: 2);
+    private readonly AnalyticsLogger _analytics = new();
     private SpriteBatch _spriteBatch = null!;
     private Texture2D _pixel = null!;
     private KeyboardState _previousKeyboard;
     private MouseState _previousMouse;
     private float _timeScale = 1f;
-    private bool _paused;
+    private bool _paused = true;
     private bool _isFullscreen;
     private int _windowedWidth = 1280;
     private int _windowedHeight = 720;
@@ -34,6 +35,7 @@ public sealed class Game1 : Game
         Content.RootDirectory = "Content";
         IsMouseVisible = true;
         Window.Title = "Hollowbound";
+        _analytics.LogEvent("run_started", _world, _timeScale, _paused);
     }
 
     protected override void LoadContent()
@@ -52,7 +54,11 @@ public sealed class Game1 : Game
             Exit();
 
         if (IsPressed(keyboard, Keys.Space))
+        {
             _paused = !_paused;
+            _world.ClearBacklog();
+            _analytics.LogEvent(_paused ? "paused" : "resumed", _world, _timeScale, _paused);
+        }
 
         if (IsPressed(keyboard, Keys.N))
             ResetWorld();
@@ -63,6 +69,7 @@ public sealed class Game1 : Game
 
         if (IsPressed(keyboard, Keys.Tab))
         {
+            var previousSpeed = _timeScale;
             _timeScale = _timeScale switch
             {
                 1f => 5f,
@@ -74,6 +81,7 @@ public sealed class Game1 : Game
                 250f => 500f,
                 _ => 1f,
             };
+            _analytics.LogEvent("speed_changed", _world, _timeScale, _paused, $"from={previousSpeed:0};to={_timeScale:0}");
         }
 
         if (mouse.LeftButton == ButtonState.Pressed && _previousMouse.LeftButton == ButtonState.Released)
@@ -81,6 +89,8 @@ public sealed class Game1 : Game
 
         if (!_paused)
             _world.Advance((float)gameTime.ElapsedGameTime.TotalSeconds, _timeScale);
+
+        _analytics.MaybeWriteSnapshot(_world, _timeScale, _paused);
 
         _previousKeyboard = keyboard;
         _previousMouse = mouse;
@@ -271,8 +281,16 @@ public sealed class Game1 : Game
     {
         _world = new EmergentSimulationWorld(Random.Shared.Next(1, int.MaxValue), initialPopulation: 2);
         _timeScale = 1f;
-        _paused = false;
+        _paused = true;
         _selectedAgentId = -1;
+        _analytics.LogEvent("new_world", _world, _timeScale, _paused);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+            _analytics.Dispose();
+        base.Dispose(disposing);
     }
 
     private void DrawRect(Rectangle rectangle, Color color, int border = 0)

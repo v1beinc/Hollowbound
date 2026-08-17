@@ -55,9 +55,10 @@ public sealed class EmergentSimulationWorld
 
     public void Advance(float realSeconds, float timeScale)
     {
+        var maxBacklog = GetMaxBacklogSeconds(timeScale);
         _accumulator = MathF.Min(
             _accumulator + MathF.Min(realSeconds, 0.25f) * timeScale,
-            MaxBacklogSeconds);
+            maxBacklog);
 
         var stopwatch = Stopwatch.StartNew();
         var maxSteps = GetMaxStepsPerFrame(timeScale);
@@ -75,20 +76,38 @@ public sealed class EmergentSimulationWorld
         IsCatchingUp = _accumulator >= TickLength;
     }
 
+    public void ClearBacklog()
+    {
+        _accumulator = 0;
+        IsCatchingUp = false;
+    }
+
+    private static float GetMaxBacklogSeconds(float timeScale) => timeScale switch
+    {
+        >= 100f => 0.5f,
+        >= 25f => 1f,
+        _ => MaxBacklogSeconds,
+    };
+
     private static int GetMaxStepsPerFrame(float timeScale) => timeScale switch
     {
-        >= 500f => 5,
-        >= 100f => 8,
-        >= 25f => 12,
+        >= 500f => 2,
+        >= 250f => 3,
+        >= 100f => 4,
+        >= 50f => 6,
+        >= 25f => 8,
+        >= 10f => 12,
         >= 5f => 18,
         _ => MaxStepsPerFrame,
     };
 
     private static double GetSimulationBudgetMilliseconds(float timeScale) => timeScale switch
     {
-        >= 500f => 1.5d,
-        >= 100f => 2d,
-        >= 25f => 3d,
+        >= 500f => 0.75d,
+        >= 250f => 1d,
+        >= 100f => 1.5d,
+        >= 50f => 2d,
+        >= 25f => 2.5d,
         >= 5f => 4d,
         _ => MaxSimulationMillisecondsPerFrame,
     };
