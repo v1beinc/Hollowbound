@@ -16,6 +16,8 @@ public sealed class SimulationWorld
     public const int Width = 128;
     public const int Height = 80;
     public const float TickLength = 0.1f;
+    public const int MaxStepsPerFrame = 20;
+    public const float MaxBacklogSeconds = 2f;
 
     private readonly Random _rng;
     private readonly List<ResourceNode> _food = new();
@@ -31,6 +33,7 @@ public sealed class SimulationWorld
     public int Deaths { get; private set; }
     public long Tick { get; private set; }
     public int Seed { get; }
+    public bool IsCatchingUp { get; private set; }
 
     public SimulationWorld(int seed, int initialPopulation = 40)
     {
@@ -42,13 +45,17 @@ public sealed class SimulationWorld
 
     public void Advance(float realSeconds, float timeScale)
     {
-        _accumulator += MathF.Min(realSeconds, 0.25f) * timeScale;
+        _accumulator = MathF.Min(
+            _accumulator + MathF.Min(realSeconds, 0.25f) * timeScale,
+            MaxBacklogSeconds);
         var steps = 0;
-        while (_accumulator >= TickLength && steps++ < 500)
+        while (_accumulator >= TickLength && steps < MaxStepsPerFrame)
         {
             Step(TickLength);
             _accumulator -= TickLength;
+            steps++;
         }
+        IsCatchingUp = steps == MaxStepsPerFrame && _accumulator >= TickLength;
     }
 
     private void Step(float dt)
@@ -61,6 +68,7 @@ public sealed class SimulationWorld
 
             agent.Age += dt;
             agent.Energy -= dt * 0.035f;
+            agent.MoveCooldown = MathF.Max(0, agent.MoveCooldown - dt);
 
             if (agent.Energy <= 0)
             {
@@ -111,16 +119,19 @@ public sealed class SimulationWorld
 
     private void Move(AgentState agent, float dt)
     {
-        var delta = agent.Target - agent.Position;
-        if (delta.LengthSquared() < 0.04f)
+        if (agent.MoveCooldown > 0)
             return;
 
-        delta.Normalize();
-        var speed = agent.Action == "returning" ? 3.4f : 2.5f;
-        agent.Position += delta * speed * dt;
+        var delta = agent.Target - agent.Position;
+        if (delta.LengthSquared() < 0.25f)
+            return;
+
+        var step = new Vector2(MathF.Sign(delta.X), MathF.Sign(delta.Y));
+        agent.Position += step;
         agent.Position = new Vector2(
-            MathHelper.Clamp(agent.Position.X, 1, Width - 2),
-            MathHelper.Clamp(agent.Position.Y, 1, Height - 2));
+            MathHelper.Clamp(MathF.Round(agent.Position.X), 1, Width - 2),
+            MathHelper.Clamp(MathF.Round(agent.Position.Y), 1, Height - 2));
+        agent.MoveCooldown = agent.Action == "returning" ? 0.1f : 0.2f;
     }
 
     private void ResolveAction(AgentState agent)
@@ -162,7 +173,9 @@ public sealed class SimulationWorld
         {
             Id = _nextAgentId++,
             FactionId = parents[0].FactionId,
-            Position = center + new Vector2((float)(_rng.NextDouble() - 0.5), (float)(_rng.NextDouble() - 0.5)),
+            Position = new Vector2(
+                _rng.Next(Shelter.X + 2, Shelter.Right - 1),
+                _rng.Next(Shelter.Y + 2, Shelter.Bottom - 1)),
             Target = center,
             Action = "newborn",
         });
@@ -174,9 +187,9 @@ public sealed class SimulationWorld
         var center = ShelterCenter();
         for (var i = 0; i < count; i++)
         {
-            var position = center + new Vector2(
-                (float)(_rng.NextDouble() * 8 - 4),
-                (float)(_rng.NextDouble() * 5 - 2.5));
+            var position = new Vector2(
+                Shelter.X + 2 + i % Math.Max(1, Shelter.Width - 4),
+                Shelter.Y + 2 + (i / Math.Max(1, Shelter.Width - 4)) % Math.Max(1, Shelter.Height - 4));
             _agents.Add(new AgentState
             {
                 Id = _nextAgentId++,

@@ -10,8 +10,9 @@ namespace Hollowbound;
 public sealed class Game1 : Game
 {
     private const float TileSize = 8f;
+    private const float AgentSize = 6f / 8f; // 6 pixels in world units
     private readonly GraphicsDeviceManager _graphics;
-    private readonly SimulationWorld _world = new(seed: 47291, initialPopulation: 40);
+    private readonly SimulationWorld _world = new(seed: 47291, initialPopulation: 2);
     private SpriteBatch _spriteBatch = null!;
     private Texture2D _pixel = null!;
     private KeyboardState _previousKeyboard;
@@ -111,13 +112,16 @@ public sealed class Game1 : Game
         {
             if (!agent.Alive)
                 continue;
-            var color = agent.FactionId == 0 ? new Color(84, 161, 174) : new Color(181, 116, 72);
-            DrawWorldRect(agent.Position, new Vector2(0.55f, 0.55f), color);
+            var factionColor = agent.FactionId == 0 ? new Color(84, 161, 174) : new Color(181, 116, 72);
+            var borderColor = new Color(20, 24, 30);
+            DrawWorldRect(agent.Position, new Vector2(AgentSize, AgentSize), factionColor);
+            DrawWorldRectBorder(agent.Position, new Vector2(AgentSize, AgentSize), borderColor, 1);
 
             if (agent.Id == _selectedAgentId)
             {
                 var screen = WorldToScreen(agent.Position);
-                DrawRect(new Rectangle((int)screen.X - 5, (int)screen.Y - 5, 10, 10), new Color(228, 220, 163), 1);
+                var rect = new Rectangle((int)screen.X - 4, (int)screen.Y - 4, (int)(AgentSize * TileSize) + 8, (int)(AgentSize * TileSize) + 8);
+                DrawRect(rect, new Color(228, 220, 163), 2);
             }
         }
     }
@@ -125,25 +129,44 @@ public sealed class Game1 : Game
     private void DrawShelter()
     {
         var shelter = _world.Shelter;
-        var wallColor = new Color(113, 119, 128);
-        const float wall = 0.65f;
-        DrawWorldRect(new Vector2(shelter.X, shelter.Y), new Vector2(shelter.Width, wall), wallColor);
-        DrawWorldRect(new Vector2(shelter.X, shelter.Bottom - wall), new Vector2(6.5f, wall), wallColor);
-        DrawWorldRect(new Vector2(shelter.Right - 6.5f, shelter.Bottom - wall), new Vector2(6.5f, wall), wallColor);
-        DrawWorldRect(new Vector2(shelter.X, shelter.Y), new Vector2(wall, shelter.Height), wallColor);
-        DrawWorldRect(new Vector2(shelter.Right - wall, shelter.Y), new Vector2(wall, shelter.Height), wallColor);
-        DrawWorldRect(new Vector2(shelter.X + 1.1f, shelter.Y + 1.1f), new Vector2(shelter.Width - 2.2f, shelter.Height - 2.2f), new Color(30, 36, 43));
+        var wallColor = new Color(140, 145, 155);
+        var wallHighlight = new Color(180, 185, 195);
+        const float wall = 0.75f;
+        var top = new Vector2(shelter.X, shelter.Y);
+        var left = new Vector2(shelter.X, shelter.Y);
+        var right = new Vector2(shelter.Right - wall, shelter.Y);
+        var bottom = new Vector2(shelter.X, shelter.Bottom - wall);
+
+        DrawWorldRect(top, new Vector2(shelter.Width, wall), wallColor);
+        DrawWorldRect(left, new Vector2(wall, shelter.Height), wallColor);
+        DrawWorldRect(right, new Vector2(wall, shelter.Height), wallColor);
+
+        DrawWorldRect(bottom, new Vector2(6f, wall), wallColor);
+        DrawWorldRect(new Vector2(shelter.Right - 6f, shelter.Bottom - wall), new Vector2(6f, wall), wallColor);
+
+        const float highlight = 0.15f;
+        DrawWorldRect(new Vector2(shelter.X, shelter.Y + 0.1f), new Vector2(shelter.Width, highlight), wallHighlight);
+        DrawWorldRect(new Vector2(shelter.X + 0.1f, shelter.Y), new Vector2(highlight, shelter.Height), wallHighlight);
+        DrawWorldRect(new Vector2(shelter.Right - wall - 0.1f, shelter.Y), new Vector2(highlight, shelter.Height), wallHighlight);
+
+        var storedFood = Math.Min(16, _world.FoodStockpile);
+        for (var i = 0; i < storedFood; i++)
+        {
+            var storagePosition = new Vector2(shelter.X + 2 + i % 4, shelter.Y + 2 + i / 4);
+            DrawWorldRect(storagePosition, new Vector2(0.45f, 0.45f), new Color(190, 145, 67));
+        }
     }
 
     private void DrawInterface()
     {
         DrawRect(new Rectangle(18, 16, 760, 76), new Color(8, 10, 13, 225));
         var alive = _world.Agents.Count(agent => agent.Alive);
-        var header = $"SEEDFALL  //  tick {_world.Tick:N0}  //  population {alive:N0}  //  seed {_world.Seed}";
+        var header = $"HOLLOWBOUND  //  tick {_world.Tick:N0}  //  population {alive:N0}  //  seed {_world.Seed}";
         var stats = $"food {_world.FoodStockpile:N0}   births {_world.Births:N0}   deaths {_world.Deaths:N0}   speed x{_timeScale:0}";
+        var catchingUp = _world.IsCatchingUp ? "   CATCHING UP" : "";
         var controls = $"[SPACE] {(_paused ? "resume" : "pause")}   [TAB] speed   [LMB] inspect agent";
         DrawText(header, new Vector2(30, 26), new Color(218, 218, 203));
-        DrawText(stats, new Vector2(30, 47), new Color(152, 162, 171));
+        DrawText(stats + catchingUp, new Vector2(30, 47), new Color(152, 162, 171));
         DrawText(controls, new Vector2(30, 68), new Color(111, 128, 137));
 
         var selected = _world.Agents.FirstOrDefault(agent => agent.Id == _selectedAgentId);
@@ -186,6 +209,13 @@ public sealed class Game1 : Game
     {
         var topLeft = WorldToScreen(position);
         DrawRect(new Rectangle((int)topLeft.X, (int)topLeft.Y, Math.Max(1, (int)(size.X * TileSize)), Math.Max(1, (int)(size.Y * TileSize))), color);
+    }
+
+    private void DrawWorldRectBorder(Vector2 position, Vector2 size, Color color, int border)
+    {
+        var topLeft = WorldToScreen(position);
+        var rect = new Rectangle((int)topLeft.X, (int)topLeft.Y, Math.Max(1, (int)(size.X * TileSize)), Math.Max(1, (int)(size.Y * TileSize)));
+        DrawRect(rect, color, border);
     }
 
     private void DrawRect(Rectangle rectangle, Color color, int border = 0)

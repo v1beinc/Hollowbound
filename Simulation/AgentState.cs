@@ -11,6 +11,7 @@ public sealed class AgentState
     public float Energy { get; set; } = 100f;
     public float Age { get; set; }
     public int CarriedFood { get; set; }
+    public float MoveCooldown { get; set; }
     public string Action { get; set; } = "idle";
     public bool Alive { get; set; } = true;
 }
