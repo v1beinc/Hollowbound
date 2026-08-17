@@ -96,38 +96,128 @@ public sealed class Map
         }
     }
 
-    public void InitializeShelter(Rectangle shelterBounds)
+    public void InitializeOpen()
     {
-        for (int y = shelterBounds.Top; y < shelterBounds.Bottom; y++)
-        {
-            for (int x = shelterBounds.Left; x < shelterBounds.Right; x++)
-            {
-                bool isWall = x == shelterBounds.Left || x == shelterBounds.Right - 1 ||
-                              y == shelterBounds.Top || y == shelterBounds.Bottom - 1;
-
-                if (isWall)
-                {
-                    bool isDoor = y == shelterBounds.Bottom - 1 &&
-                                  x >= shelterBounds.Left + 6 && x <= shelterBounds.Right - 7;
-                    this[x, y] = isDoor ? CellType.Door : CellType.Wall;
-                }
-                else
-                {
-                    bool isStorage = x >= shelterBounds.Left + 2 && x <= shelterBounds.Right - 3 &&
-                                     y >= shelterBounds.Top + 2 && y <= shelterBounds.Bottom - 3;
-                    this[x, y] = isStorage ? CellType.Storage : CellType.Floor;
-                }
-            }
-        }
-
         for (int y = 0; y < Height; y++)
         {
             for (int x = 0; x < Width; x++)
             {
-                if (_cells[y * Width + x] == CellType.Empty)
-                    this[x, y] = CellType.Floor;
+                this[x, y] = CellType.Floor;
             }
         }
+    }
+
+    // Compatibility helper for the archived pre-emergent simulation.
+    // The active game uses InitializeOpen and never creates a preset shelter.
+    public void InitializeShelter(Rectangle shelterBounds)
+    {
+        InitializeOpen();
+        for (var x = shelterBounds.Left; x < shelterBounds.Right; x++)
+        {
+            this[x, shelterBounds.Top] = CellType.Wall;
+            this[x, shelterBounds.Bottom - 1] = CellType.Wall;
+        }
+        for (var y = shelterBounds.Top; y < shelterBounds.Bottom; y++)
+        {
+            this[shelterBounds.Left, y] = CellType.Wall;
+            this[shelterBounds.Right - 1, y] = CellType.Wall;
+        }
+        this[shelterBounds.Center.X, shelterBounds.Bottom - 1] = CellType.Door;
+        for (var y = shelterBounds.Top + 1; y < shelterBounds.Bottom - 1; y++)
+        {
+            for (var x = shelterBounds.Left + 1; x < shelterBounds.Right - 1; x++)
+                this[x, y] = CellType.Storage;
+        }
+    }
+
+    public bool CanBuildWallSegment(Point start, bool horizontal)
+    {
+        for (var i = 0; i < 3; i++)
+        {
+            var cell = horizontal
+                ? new Point(start.X + i, start.Y)
+                : new Point(start.X, start.Y + i);
+            if (!InBounds(cell) || this[cell] != CellType.Floor)
+                return false;
+        }
+        return true;
+    }
+
+    public bool BuildWallSegment(Point start, bool horizontal)
+    {
+        if (!CanBuildWallSegment(start, horizontal))
+            return false;
+
+        for (var i = 0; i < 3; i++)
+        {
+            var cell = horizontal
+                ? new Point(start.X + i, start.Y)
+                : new Point(start.X, start.Y + i);
+            this[cell] = CellType.Wall;
+        }
+        return true;
+    }
+
+    public Point? FindNearestWall(Point from)
+    {
+        Point? best = null;
+        var bestDistance = int.MaxValue;
+        foreach (var wall in _wallCells)
+        {
+            var distance = Math.Abs(wall.X - from.X) + Math.Abs(wall.Y - from.Y);
+            if (distance < bestDistance)
+            {
+                best = wall;
+                bestDistance = distance;
+            }
+        }
+        return best;
+    }
+
+    public Point? FindNearestWallApproach(Point from)
+    {
+        Point? best = null;
+        var bestDistance = int.MaxValue;
+        foreach (var wall in _wallCells)
+        {
+            for (var dy = -1; dy <= 1; dy++)
+            {
+                for (var dx = -1; dx <= 1; dx++)
+                {
+                    if (dx == 0 && dy == 0)
+                        continue;
+
+                    var approach = new Point(wall.X + dx, wall.Y + dy);
+                    if (!IsWalkable(approach))
+                        continue;
+
+                    var distance = Math.Abs(approach.X - from.X) + Math.Abs(approach.Y - from.Y);
+                    if (distance < bestDistance)
+                    {
+                        best = approach;
+                        bestDistance = distance;
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    public bool IsNearWall(Point cell)
+    {
+        for (var dy = -1; dy <= 1; dy++)
+        {
+            for (var dx = -1; dx <= 1; dx++)
+            {
+                if (dx != 0 || dy != 0)
+                {
+                    var neighbor = new Point(cell.X + dx, cell.Y + dy);
+                    if (InBounds(neighbor) && this[neighbor] == CellType.Wall)
+                        return true;
+                }
+            }
+        }
+        return false;
     }
 
     public Point FindNearestStorage(Point from)

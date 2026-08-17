@@ -9,10 +9,12 @@ public enum AgentAction : byte
     GoingToFood = 2,
     GatheringFood = 3,
     CarryingFood = 4,
-    ReturningHome = 5,
+    ReturningToWall = 5,
+    ReturningHome = ReturningToWall,
     StoringFood = 6,
     Resting = 7,
-    Dead = 8,
+    Building = 8,
+    Dead = 9,
 }
 
 public sealed class AgentState
@@ -30,6 +32,7 @@ public sealed class AgentState
     public int CarriedFood { get; set; }
     public float MoveCooldown { get; set; }
     public float RestTimer { get; set; }
+    public float BuildCooldown { get; set; }
     public AgentAction Action { get; set; } = AgentAction.Idle;
     public bool Alive { get; set; } = true;
 }

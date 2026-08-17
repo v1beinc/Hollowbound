@@ -11,7 +11,7 @@ public sealed class Game1 : Game
 {
     private const float MinimumTileSize = 8f;
     private readonly GraphicsDeviceManager _graphics;
-    private readonly SimulationWorld _world = new(seed: 47291, initialPopulation: 2);
+    private readonly EmergentSimulationWorld _world = new(seed: 47291, initialPopulation: 2);
     private SpriteBatch _spriteBatch = null!;
     private Texture2D _pixel = null!;
     private KeyboardState _previousKeyboard;
@@ -96,12 +96,12 @@ public sealed class Game1 : Game
         var viewport = GraphicsDevice.Viewport;
         var tileSize = GetTileSize();
         var mapTopLeft = GetMapTopLeft(tileSize);
-        var mapBounds = new Rectangle((int)mapTopLeft.X, (int)mapTopLeft.Y, (int)(SimulationWorld.Width * tileSize), (int)(SimulationWorld.Height * tileSize));
+        var mapBounds = new Rectangle((int)mapTopLeft.X, (int)mapTopLeft.Y, (int)(EmergentSimulationWorld.Width * tileSize), (int)(EmergentSimulationWorld.Height * tileSize));
         DrawRect(mapBounds, new Color(22, 27, 34));
 
-        for (var x = 0; x < SimulationWorld.Width; x += 4)
+        for (var x = 0; x < EmergentSimulationWorld.Width; x += 4)
             DrawRect(new Rectangle((int)(mapTopLeft.X + x * tileSize), mapBounds.Top, 1, mapBounds.Height), new Color(28, 34, 42));
-        for (var y = 0; y < SimulationWorld.Height; y += 4)
+        for (var y = 0; y < EmergentSimulationWorld.Height; y += 4)
             DrawRect(new Rectangle(mapBounds.Left, (int)(mapTopLeft.Y + y * tileSize), mapBounds.Width, 1), new Color(28, 34, 42));
 
         foreach (var wall in _world.Map.WallCells)
@@ -156,7 +156,7 @@ public sealed class Game1 : Game
         DrawRect(new Rectangle(18, 16, Math.Min(viewport.Width - 36, 900), 82), new Color(8, 10, 13, 225));
         var alive = _world.Agents.Count(agent => agent.Alive);
         var header = $"HOLLOWBOUND  //  tick {_world.Tick:N0}  //  population {alive:N0}  //  seed {_world.Seed}";
-        var stats = $"food {_world.FoodStockpile:N0}   births {_world.Births:N0}   deaths {_world.Deaths:N0}   speed x{_timeScale:0}";
+        var stats = $"food {_world.FoodStockpile:N0}   walls {_world.Map.WallCells.Count / 3:N0}   births {_world.Births:N0}   deaths {_world.Deaths:N0}   speed x{_timeScale:0}";
         var catchingUp = _world.IsCatchingUp ? "   CATCHING UP" : "";
         var controls = $"[SPACE] {(_paused ? "resume" : "pause")}   [TAB] speed   [F11] fullscreen   [LMB] inspect";
         DrawText(header, new Vector2(30, 26), new Color(218, 218, 203));
@@ -202,15 +202,15 @@ public sealed class Game1 : Game
     private float GetTileSize()
     {
         var viewport = GraphicsDevice.Viewport;
-        var widthScale = (viewport.Width - 40f) / SimulationWorld.Width;
-        var heightScale = (viewport.Height - 40f) / SimulationWorld.Height;
+        var widthScale = (viewport.Width - 40f) / EmergentSimulationWorld.Width;
+        var heightScale = (viewport.Height - 40f) / EmergentSimulationWorld.Height;
         return MathF.Max(MinimumTileSize, MathF.Min(widthScale, heightScale));
     }
 
     private Vector2 GetMapTopLeft(float tileSize)
     {
         var viewport = GraphicsDevice.Viewport;
-        var mapSize = new Vector2(SimulationWorld.Width * tileSize, SimulationWorld.Height * tileSize);
+        var mapSize = new Vector2(EmergentSimulationWorld.Width * tileSize, EmergentSimulationWorld.Height * tileSize);
         return new Vector2(viewport.Width, viewport.Height) / 2f - mapSize / 2f;
     }
 
