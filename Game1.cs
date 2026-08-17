@@ -11,7 +11,7 @@ public sealed class Game1 : Game
 {
     private const float MinimumTileSize = 8f;
     private readonly GraphicsDeviceManager _graphics;
-    private readonly EmergentSimulationWorld _world = new(seed: 47291, initialPopulation: 2);
+    private readonly EmergentSimulationWorld _world = new(seed: Random.Shared.Next(1, int.MaxValue), initialPopulation: 2);
     private SpriteBatch _spriteBatch = null!;
     private Texture2D _pixel = null!;
     private KeyboardState _previousKeyboard;
@@ -154,6 +154,10 @@ public sealed class Game1 : Game
             var agentRect = new Rectangle(rect.Center.X - size / 2, rect.Center.Y - size / 2, size, size);
             DrawRect(agentRect, factionColor);
             DrawRect(agentRect, new Color(18, 22, 28), 1);
+            var markerSize = Math.Max(2, size / 4);
+            var markerX = rect.Center.X + Math.Clamp(agent.Facing.X, -1, 1) * Math.Max(1, size / 4) - markerSize / 2;
+            var markerY = rect.Center.Y + Math.Clamp(agent.Facing.Y, -1, 1) * Math.Max(1, size / 4) - markerSize / 2;
+            DrawRect(new Rectangle(markerX, markerY, markerSize, markerSize), new Color(226, 211, 154));
 
             if (agent.Id == _selectedAgentId)
                 DrawRect(new Rectangle(agentRect.Left - 3, agentRect.Top - 3, agentRect.Width + 6, agentRect.Height + 6), new Color(228, 220, 163), 2);

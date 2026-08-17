@@ -22,6 +22,7 @@ public sealed class AgentState
     public int Id { get; init; }
     public int FactionId { get; set; }
     public Point Cell { get; set; }
+    public Point Facing { get; set; } = new(1, 0);
     public Point TargetCell { get; set; }
     public Point FoodTargetCell { get; set; }
     public bool HasFoodTarget { get; set; }
@@ -40,6 +41,11 @@ public sealed class AgentState
     public float FoodKnowledge { get; set; }
     public int SuccessfulFoodTrips { get; set; }
     public int FailedFoodTrips { get; set; }
+    public float BuildDrive { get; set; }
+    public float ExplorationDrive { get; set; }
+    public float RiskTolerance { get; set; }
+    public float LearningRate { get; set; }
+    public int PreferredBuildDirection { get; set; }
     public AgentAction Action { get; set; } = AgentAction.Idle;
     public bool Alive { get; set; } = true;
 }
