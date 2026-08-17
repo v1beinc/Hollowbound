@@ -134,6 +134,16 @@ public sealed class Game1 : Game
             DrawRect(new Rectangle(rect.Center.X - size / 2, rect.Center.Y - size / 2, size, size), new Color(190, 145, 67));
         }
 
+        foreach (var pile in _world.FoodStorage)
+        {
+            if (pile.Value <= 0)
+                continue;
+            var rect = CellRect(pile.Key, tileSize, mapTopLeft);
+            var size = Math.Max(3, (int)(tileSize * 0.48f));
+            DrawRect(new Rectangle(rect.Center.X - size / 2, rect.Center.Y - size / 2, size, size), new Color(111, 79, 44));
+            DrawRect(new Rectangle(rect.Center.X - 1, rect.Center.Y - 1, 2, 2), new Color(218, 170, 78));
+        }
+
         foreach (var agent in _world.Agents)
         {
             if (!agent.Alive)
@@ -156,7 +166,7 @@ public sealed class Game1 : Game
         DrawRect(new Rectangle(18, 16, Math.Min(viewport.Width - 36, 900), 82), new Color(8, 10, 13, 225));
         var alive = _world.Agents.Count(agent => agent.Alive);
         var header = $"HOLLOWBOUND  //  tick {_world.Tick:N0}  //  population {alive:N0}  //  seed {_world.Seed}";
-        var stats = $"food {_world.FoodStockpile:N0}   walls {_world.Map.WallCells.Count / 3:N0}   births {_world.Births:N0}   deaths {_world.Deaths:N0}   speed x{_timeScale:0}";
+        var stats = $"food {_world.FoodStockpile:N0}   wall blocks {_world.Map.WallCells.Count:N0}   births {_world.Births:N0}   deaths {_world.Deaths:N0}   speed x{_timeScale:0}";
         var catchingUp = _world.IsCatchingUp ? "   CATCHING UP" : "";
         var controls = $"[SPACE] {(_paused ? "resume" : "pause")}   [TAB] speed   [F11] fullscreen   [LMB] inspect";
         DrawText(header, new Vector2(30, 26), new Color(218, 218, 203));
@@ -166,12 +176,13 @@ public sealed class Game1 : Game
         var selected = _world.Agents.FirstOrDefault(agent => agent.Id == _selectedAgentId);
         if (selected is not null)
         {
-            DrawRect(new Rectangle(18, 104, 280, 112), new Color(8, 10, 13, 225));
+            DrawRect(new Rectangle(18, 104, 310, 136), new Color(8, 10, 13, 225));
             DrawText($"AGENT #{selected.Id:0000}", new Vector2(30, 114), new Color(228, 220, 163));
             DrawText($"faction  {selected.FactionId + 1}", new Vector2(30, 136), Color.LightGray);
             DrawText($"action   {selected.Action}", new Vector2(30, 157), Color.LightGray);
             DrawText($"energy   {selected.Energy:0.0}", new Vector2(30, 178), Color.LightGray);
             DrawText($"age      {selected.Age:0.0}s   food {selected.CarriedFood}", new Vector2(30, 199), Color.LightGray);
+            DrawText($"learning {selected.FoodKnowledge:0.00}   trips {selected.SuccessfulFoodTrips}", new Vector2(30, 220), Color.LightGray);
         }
 
         if (_paused)

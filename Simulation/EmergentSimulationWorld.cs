@@ -14,25 +14,28 @@ public sealed class EmergentSimulationWorld
     public const int MaxStepsPerFrame = 20;
     public const float MaxBacklogSeconds = 2f;
     public const double MaxSimulationMillisecondsPerFrame = 6d;
-    public const float WallBuildEnergyCost = 50f;
-    public const int MaxWallCells = 180;
+    public const float WallBuildEnergyCost = 22f;
+    public const int MaxWallCells = 220;
 
     private readonly Random _rng;
     private readonly List<ResourceNode> _food = new();
     private readonly List<AgentState> _agents = new();
+    private readonly Dictionary<Point, int> _foodStorage = new();
     private readonly Map _map;
     private readonly PathFinder _pathFinder;
     private float _accumulator;
     private int _nextAgentId;
     private int _wallBuildAttempts;
+    private float _birthCooldown;
 
     public IReadOnlyList<AgentState> Agents => _agents;
     public IReadOnlyList<ResourceNode> Food => _food;
+    public IReadOnlyDictionary<Point, int> FoodStorage => _foodStorage;
     public Map Map => _map;
-    public int FoodStockpile { get; private set; } = 12;
+    public int FoodStockpile { get; private set; } = 18;
     public int Births { get; private set; }
     public int Deaths { get; private set; }
-    public int WallSegmentsBuilt { get; private set; }
+    public int WallBlocksBuilt { get; private set; }
     public long Tick { get; private set; }
     public int Seed { get; }
     public bool IsCatchingUp { get; private set; }
@@ -102,6 +105,7 @@ public sealed class EmergentSimulationWorld
                 agent.Energy = MathF.Min(100, agent.Energy + dt * 1.5f);
         }
 
+        _birthCooldown = MathF.Max(0, _birthCooldown - dt);
         TryBirth();
         if (Tick % 50 == 0)
             RegrowFood();
@@ -139,7 +143,7 @@ public sealed class EmergentSimulationWorld
                 break;
 
             case AgentAction.SearchingFood:
-                var foodTarget = FindNearestFood(agent.Cell, agent.Id);
+                var foodTarget = FindNearestFood(agent);
                 if (foodTarget.HasValue && SetFoodTarget(agent, foodTarget.Value))
                 {
                     agent.Action = AgentAction.GoingToFood;
@@ -158,12 +162,14 @@ public sealed class EmergentSimulationWorld
                         agent.Action = AgentAction.GatheringFood;
                     else
                     {
+                        MarkFoodFailure(agent);
                         ReleaseFoodReservation(agent);
                         agent.Action = AgentAction.SearchingFood;
                     }
                 }
                 else if (agent.Path.Count == 0 || agent.PathIndex >= agent.Path.Count)
                 {
+                    MarkFoodFailure(agent);
                     ReleaseFoodReservation(agent);
                     agent.Action = AgentAction.SearchingFood;
                 }
@@ -179,6 +185,7 @@ public sealed class EmergentSimulationWorld
                 }
                 else if (foodAtCell is null || foodAtCell.Amount <= 0)
                 {
+                    MarkFoodFailure(agent);
                     ReleaseFoodReservation(agent);
                     if (agent.CarriedFood > 0)
                     {
@@ -248,9 +255,17 @@ public sealed class EmergentSimulationWorld
             var node = FindFoodAt(agent.Cell);
             if (node is not null && node.Amount > 0)
             {
+                var firstUnit = agent.CarriedFood == 0;
                 node.Amount--;
                 agent.CarriedFood++;
                 agent.Energy = MathF.Min(100, agent.Energy + 5);
+                if (firstUnit)
+                {
+                    agent.KnownFoodCell = agent.Cell;
+                    agent.HasKnownFood = true;
+                    agent.FoodKnowledge = MathF.Min(1f, agent.FoodKnowledge + 0.2f);
+                    agent.SuccessfulFoodTrips++;
+                }
                 if (node.Amount <= 0)
                     ReleaseFoodReservation(agent);
             }
@@ -258,7 +273,15 @@ public sealed class EmergentSimulationWorld
 
         if (agent.Action == AgentAction.StoringFood && agent.CarriedFood > 0)
         {
-            FoodStockpile += agent.CarriedFood;
+            var stored = agent.CarriedFood;
+            FoodStockpile += stored;
+            _foodStorage[agent.Cell] = _foodStorage.GetValueOrDefault(agent.Cell) + stored;
+            var homeWall = _map.FindNearestWall(agent.Cell);
+            if (homeWall.HasValue)
+            {
+                agent.HomeWallCell = homeWall.Value;
+                agent.HasHomeWall = true;
+            }
             agent.CarriedFood = 0;
             agent.Energy = MathF.Min(100, agent.Energy + 4);
             agent.Action = AgentAction.Resting;
@@ -275,64 +298,68 @@ public sealed class EmergentSimulationWorld
     private bool TryStartBuilding(AgentState agent)
     {
         if (agent.BuildCooldown > 0 || agent.Energy < WallBuildEnergyCost ||
-            _map.WallCells.Count + 3 > MaxWallCells || agent.CarriedFood > 0)
+            _map.WallCells.Count + 1 > MaxWallCells || agent.CarriedFood > 0)
             return false;
 
-        var candidates = new List<(Point Start, bool Horizontal)>();
+        var candidates = new List<Point>();
         var nearestWall = _map.FindNearestWall(agent.Cell);
         if (nearestWall.HasValue &&
-            Math.Abs(nearestWall.Value.X - agent.Cell.X) + Math.Abs(nearestWall.Value.Y - agent.Cell.Y) <= 7)
+            Math.Abs(nearestWall.Value.X - agent.Cell.X) + Math.Abs(nearestWall.Value.Y - agent.Cell.Y) <= 9)
         {
             var wall = nearestWall.Value;
-            candidates.Add((new Point(wall.X - 1, wall.Y - 1), true));
-            candidates.Add((new Point(wall.X - 1, wall.Y + 1), true));
-            candidates.Add((new Point(wall.X - 1, wall.Y - 1), false));
-            candidates.Add((new Point(wall.X + 1, wall.Y - 1), false));
+            for (var radius = 1; radius <= 2; radius++)
+            {
+                for (var dy = -radius; dy <= radius; dy++)
+                {
+                    for (var dx = -radius; dx <= radius; dx++)
+                    {
+                        if (Math.Abs(dx) + Math.Abs(dy) != radius)
+                            continue;
+                        candidates.Add(new Point(wall.X + dx, wall.Y + dy));
+                    }
+                }
+            }
         }
         else
         {
-            candidates.Add((new Point(agent.Cell.X - 1, agent.Cell.Y - 1), true));
-            candidates.Add((new Point(agent.Cell.X - 1, agent.Cell.Y + 1), true));
-            candidates.Add((new Point(agent.Cell.X - 1, agent.Cell.Y - 1), false));
-            candidates.Add((new Point(agent.Cell.X + 1, agent.Cell.Y - 1), false));
+            for (var dy = -1; dy <= 1; dy++)
+            {
+                for (var dx = -1; dx <= 1; dx++)
+                {
+                    if (dx != 0 || dy != 0)
+                        candidates.Add(new Point(agent.Cell.X + dx, agent.Cell.Y + dy));
+                }
+            }
         }
 
         var offset = _wallBuildAttempts++ % candidates.Count;
         for (var i = 0; i < candidates.Count; i++)
         {
             var candidate = candidates[(i + offset) % candidates.Count];
-            if (!CanBuildAt(candidate.Start, candidate.Horizontal))
+            if (!CanBuildAt(candidate))
                 continue;
 
-            _map.BuildWallSegment(candidate.Start, candidate.Horizontal);
+            _map.BuildWallCell(candidate);
             agent.Energy -= WallBuildEnergyCost;
-            agent.BuildCooldown = 8f;
+            agent.BuildCooldown = 4f;
             agent.Action = AgentAction.Building;
             agent.Path.Clear();
             agent.PathIndex = 0;
-            WallSegmentsBuilt++;
+            agent.HomeWallCell = candidate;
+            agent.HasHomeWall = true;
+            WallBlocksBuilt++;
             return true;
         }
 
         return false;
     }
 
-    private bool CanBuildAt(Point start, bool horizontal)
+    private bool CanBuildAt(Point cell)
     {
-        if (!_map.CanBuildWallSegment(start, horizontal))
+        if (!_map.CanBuildWallCell(cell))
             return false;
 
-        for (var i = 0; i < 3; i++)
-        {
-            var cell = horizontal
-                ? new Point(start.X + i, start.Y)
-                : new Point(start.X, start.Y + i);
-
-            if (_agents.Any(agent => agent.Alive && agent.Cell == cell) || FindFoodAt(cell) is not null)
-                return false;
-        }
-
-        return true;
+        return !_agents.Any(agent => agent.Alive && agent.Cell == cell) && FindFoodAt(cell) is null;
     }
 
     private bool SetPathToNearestWall(AgentState agent)
@@ -355,32 +382,92 @@ public sealed class EmergentSimulationWorld
     private void TryBirth()
     {
         var alive = _agents.Count(a => a.Alive);
-        if (alive >= 250 || FoodStockpile < Math.Max(4, alive / 2) || _rng.NextDouble() > 0.0015)
+        if (_birthCooldown > 0 || alive >= 250 || FoodStockpile < Math.Max(8, alive * 2) || _rng.NextDouble() > 0.01)
             return;
 
-        var parents = _agents
-            .Where(a => a.Alive && _map.IsNearWall(a.Cell) && a.Energy > 70)
-            .Take(2)
+        var candidates = _agents
+            .Where(a => a.Alive && _map.IsNearWall(a.Cell) && a.Energy > 65 && a.Age >= 5f)
             .ToArray();
-        if (parents.Length < 2)
+        AgentState? firstParent = null;
+        AgentState? secondParent = null;
+        for (var i = 0; i < candidates.Length && firstParent is null; i++)
+        {
+            for (var j = i + 1; j < candidates.Length; j++)
+            {
+                var distance = Math.Abs(candidates[i].Cell.X - candidates[j].Cell.X) +
+                               Math.Abs(candidates[i].Cell.Y - candidates[j].Cell.Y);
+                if (distance <= 8)
+                {
+                    firstParent = candidates[i];
+                    secondParent = candidates[j];
+                    break;
+                }
+            }
+        }
+
+        if (firstParent is null || secondParent is null)
             return;
 
-        var spawnCell = _map.FindNearestWallApproach(parents[0].Cell) ?? parents[0].Cell;
-        if (!_map.IsWalkable(spawnCell) || _agents.Any(a => a.Alive && a.Cell == spawnCell))
+        var spawnCell = FindFreeHomeCell(firstParent.Cell);
+        if (!spawnCell.HasValue)
             return;
 
-        FoodStockpile = Math.Max(0, FoodStockpile - 4);
+        FoodStockpile = Math.Max(0, FoodStockpile - 6);
+        ConsumeStoredFood(6);
+        firstParent.Energy -= 8;
+        secondParent.Energy -= 8;
         _agents.Add(new AgentState
         {
             Id = _nextAgentId++,
-            FactionId = parents[0].FactionId,
-            Cell = spawnCell,
-            TargetCell = spawnCell,
+            FactionId = firstParent.FactionId,
+            Cell = spawnCell.Value,
+            TargetCell = spawnCell.Value,
             Action = AgentAction.Resting,
             RestTimer = 3f,
             Energy = 80f,
         });
         Births++;
+        _birthCooldown = 4f;
+    }
+
+    private Point? FindFreeHomeCell(Point center)
+    {
+        for (var radius = 1; radius <= 4; radius++)
+        {
+            for (var dy = -radius; dy <= radius; dy++)
+            {
+                for (var dx = -radius; dx <= radius; dx++)
+                {
+                    if (Math.Abs(dx) + Math.Abs(dy) != radius)
+                        continue;
+
+                    var cell = new Point(center.X + dx, center.Y + dy);
+                    if (!_map.IsWalkable(cell) || !_map.IsNearWall(cell))
+                        continue;
+                    if (_agents.Any(agent => agent.Alive && agent.Cell == cell) || FindFoodAt(cell) is not null)
+                        continue;
+                    return cell;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private void ConsumeStoredFood(int amount)
+    {
+        var remaining = amount;
+        foreach (var cell in _foodStorage.Keys.ToArray())
+        {
+            if (remaining <= 0)
+                break;
+
+            var taken = Math.Min(remaining, _foodStorage[cell]);
+            _foodStorage[cell] -= taken;
+            remaining -= taken;
+            if (_foodStorage[cell] <= 0)
+                _foodStorage.Remove(cell);
+        }
     }
 
     private void GenerateAgents(int count)
@@ -465,18 +552,21 @@ public sealed class EmergentSimulationWorld
         agent.HasFoodTarget = false;
     }
 
-    private Point? FindNearestFood(Point from, int agentId)
+    private Point? FindNearestFood(AgentState agent)
     {
         Point? best = null;
         var bestScore = int.MaxValue;
         foreach (var node in _food)
         {
-            if (node.Amount <= 0 || !node.CanReserve(agentId))
+            if (node.Amount <= 0 || !node.CanReserve(agent.Id))
                 continue;
 
-            var distance = Math.Abs(node.Cell.X - from.X) + Math.Abs(node.Cell.Y - from.Y);
-            var reservationPenalty = node.ReservedBy.Contains(agentId) ? 0 : node.ReservedBy.Count * 12;
-            var score = distance + reservationPenalty;
+            var distance = Math.Abs(node.Cell.X - agent.Cell.X) + Math.Abs(node.Cell.Y - agent.Cell.Y);
+            var reservationPenalty = node.ReservedBy.Contains(agent.Id) ? 0 : node.ReservedBy.Count * 12;
+            var learnedBonus = agent.HasKnownFood && agent.KnownFoodCell == node.Cell
+                ? (int)(25 * agent.FoodKnowledge)
+                : 0;
+            var score = distance + reservationPenalty - learnedBonus;
             if (score < bestScore)
             {
                 best = node.Cell;
@@ -485,6 +575,14 @@ public sealed class EmergentSimulationWorld
         }
 
         return best;
+    }
+
+    private void MarkFoodFailure(AgentState agent)
+    {
+        agent.FailedFoodTrips++;
+        agent.FoodKnowledge = MathF.Max(0, agent.FoodKnowledge - 0.15f);
+        if (agent.HasKnownFood && agent.KnownFoodCell == agent.FoodTargetCell && agent.FoodKnowledge <= 0.05f)
+            agent.HasKnownFood = false;
     }
 
     private ResourceNode? FindFoodAt(Point cell)

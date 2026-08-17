@@ -143,6 +143,17 @@ public sealed class Map
         return true;
     }
 
+    public bool CanBuildWallCell(Point cell) => InBounds(cell) && this[cell] == CellType.Floor;
+
+    public bool BuildWallCell(Point cell)
+    {
+        if (!CanBuildWallCell(cell))
+            return false;
+
+        this[cell] = CellType.Wall;
+        return true;
+    }
+
     public bool BuildWallSegment(Point start, bool horizontal)
     {
         if (!CanBuildWallSegment(start, horizontal))
