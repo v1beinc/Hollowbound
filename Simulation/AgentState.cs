@@ -21,6 +21,8 @@ public sealed class AgentState
     public int FactionId { get; set; }
     public Point Cell { get; set; }
     public Point TargetCell { get; set; }
+    public Point FoodTargetCell { get; set; }
+    public bool HasFoodTarget { get; set; }
     public List<Point> Path { get; set; } = new();
     public int PathIndex { get; set; }
     public float Energy { get; set; } = 100f;

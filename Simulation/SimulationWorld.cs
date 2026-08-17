@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using Microsoft.Xna.Framework;
 
@@ -7,8 +8,12 @@ namespace Hollowbound.Simulation;
 
 public sealed class ResourceNode
 {
+    public const int MaxGatherers = 2;
     public Point Cell { get; init; }
     public int Amount { get; set; }
+    public HashSet<int> ReservedBy { get; } = new();
+
+    public bool CanReserve(int agentId) => ReservedBy.Contains(agentId) || ReservedBy.Count < MaxGatherers;
 }
 
 public sealed class SimulationWorld
@@ -18,6 +23,7 @@ public sealed class SimulationWorld
     public const float TickLength = 0.1f;
     public const int MaxStepsPerFrame = 20;
     public const float MaxBacklogSeconds = 2f;
+    public const double MaxSimulationMillisecondsPerFrame = 6d;
 
     private readonly Random _rng;
     private readonly List<ResourceNode> _food = new();
@@ -58,14 +64,17 @@ public sealed class SimulationWorld
         _accumulator = MathF.Min(
             _accumulator + MathF.Min(realSeconds, 0.25f) * timeScale,
             MaxBacklogSeconds);
+        var stopwatch = Stopwatch.StartNew();
         var steps = 0;
-        while (_accumulator >= TickLength && steps < MaxStepsPerFrame)
+        while (_accumulator >= TickLength &&
+               steps < MaxStepsPerFrame &&
+               stopwatch.Elapsed.TotalMilliseconds < MaxSimulationMillisecondsPerFrame)
         {
             Step(TickLength);
             _accumulator -= TickLength;
             steps++;
         }
-        IsCatchingUp = steps == MaxStepsPerFrame && _accumulator >= TickLength;
+        IsCatchingUp = _accumulator >= TickLength;
     }
 
     private void Step(float dt)
@@ -83,6 +92,7 @@ public sealed class SimulationWorld
 
             if (agent.Energy <= 0)
             {
+                ReleaseFoodReservation(agent);
                 agent.Energy = 0;
                 agent.Alive = false;
                 agent.Action = AgentAction.Dead;
@@ -139,12 +149,10 @@ public sealed class SimulationWorld
                 break;
 
             case AgentAction.SearchingFood:
-                var foodTarget = FindNearestFood(agent.Cell);
-                if (foodTarget.HasValue)
+                var foodTarget = FindNearestFood(agent.Cell, agent.Id);
+                if (foodTarget.HasValue && SetFoodTarget(agent, foodTarget.Value))
                 {
-                    agent.TargetCell = foodTarget.Value;
                     agent.Action = AgentAction.GoingToFood;
-                    SetPath(agent, agent.TargetCell);
                 }
                 else
                 {
@@ -155,29 +163,46 @@ public sealed class SimulationWorld
             case AgentAction.GoingToFood:
                 if (agent.Cell == agent.TargetCell)
                 {
-                    agent.Action = AgentAction.GatheringFood;
+                    var targetFood = FindFoodAt(agent.TargetCell);
+                    if (targetFood is not null && targetFood.Amount > 0)
+                        agent.Action = AgentAction.GatheringFood;
+                    else
+                    {
+                        ReleaseFoodReservation(agent);
+                        agent.Action = AgentAction.SearchingFood;
+                    }
                 }
                 else if (agent.Path.Count == 0 || agent.PathIndex >= agent.Path.Count)
                 {
+                    ReleaseFoodReservation(agent);
                     agent.Action = AgentAction.SearchingFood;
                 }
                 break;
 
             case AgentAction.GatheringFood:
                 var foodAtCell = FindFoodAt(agent.Cell);
-                if (foodAtCell is not null && foodAtCell.Amount > 0 && agent.CarriedFood < 3 && agent.Energy >= 65)
+                if (agent.CarriedFood >= 3 || agent.Energy < 65)
                 {
-                    break;
-                }
-
-                if (agent.CarriedFood > 0)
-                {
+                    ReleaseFoodReservation(agent);
                     agent.Action = AgentAction.ReturningHome;
                     SetPathToNearestDoor(agent);
                 }
+                else if (foodAtCell is not null && foodAtCell.Amount > 0)
+                {
+                    break;
+                }
                 else
                 {
-                    agent.Action = AgentAction.SearchingFood;
+                    ReleaseFoodReservation(agent);
+                    if (agent.CarriedFood > 0)
+                    {
+                        agent.Action = AgentAction.ReturningHome;
+                        SetPathToNearestDoor(agent);
+                    }
+                    else
+                    {
+                        agent.Action = AgentAction.SearchingFood;
+                    }
                 }
                 break;
 
@@ -260,6 +285,8 @@ public sealed class SimulationWorld
                 node.Amount -= gathered;
                 agent.CarriedFood += gathered;
                 agent.Energy = MathF.Min(100, agent.Energy + 5);
+                if (node.Amount <= 0)
+                    ReleaseFoodReservation(agent);
             }
         }
 
@@ -358,19 +385,46 @@ public sealed class SimulationWorld
         }
     }
 
-    private Point? FindNearestFood(Point from)
+    private bool SetFoodTarget(AgentState agent, Point target)
+    {
+        var node = FindFoodAt(target);
+        if (node is null || node.Amount <= 0 || !node.CanReserve(agent.Id))
+            return false;
+
+        ReleaseFoodReservation(agent);
+        node.ReservedBy.Add(agent.Id);
+        agent.FoodTargetCell = target;
+        agent.HasFoodTarget = true;
+        SetPath(agent, target);
+        return agent.Path.Count > 0;
+    }
+
+    private void ReleaseFoodReservation(AgentState agent)
+    {
+        if (!agent.HasFoodTarget)
+            return;
+
+        foreach (var node in _food)
+            node.ReservedBy.Remove(agent.Id);
+        agent.HasFoodTarget = false;
+    }
+
+    private Point? FindNearestFood(Point from, int agentId)
     {
         Point? best = null;
-        int bestDist = int.MaxValue;
+        var bestScore = int.MaxValue;
         foreach (var node in _food)
         {
-            if (node.Amount <= 0)
+            if (node.Amount <= 0 || !node.CanReserve(agentId))
                 continue;
-            int dist = Math.Abs(node.Cell.X - from.X) + Math.Abs(node.Cell.Y - from.Y);
-            if (dist < bestDist)
+
+            var distance = Math.Abs(node.Cell.X - from.X) + Math.Abs(node.Cell.Y - from.Y);
+            var reservationPenalty = node.ReservedBy.Contains(agentId) ? 0 : node.ReservedBy.Count * 12;
+            var score = distance + reservationPenalty;
+            if (score < bestScore)
             {
                 best = node.Cell;
-                bestDist = dist;
+                bestScore = score;
             }
         }
         return best;
