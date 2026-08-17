@@ -154,6 +154,29 @@ public sealed class Map
         return true;
     }
 
+    public bool RemoveWallCell(Point cell)
+    {
+        if (!InBounds(cell) || this[cell] != CellType.Wall)
+            return false;
+
+        this[cell] = CellType.Floor;
+        return true;
+    }
+
+    public int CountAdjacentWalls(Point cell)
+    {
+        var count = 0;
+        for (var dy = -1; dy <= 1; dy++)
+        {
+            for (var dx = -1; dx <= 1; dx++)
+            {
+                if ((dx != 0 || dy != 0) && InBounds(cell.X + dx, cell.Y + dy) && this[cell.X + dx, cell.Y + dy] == CellType.Wall)
+                    count++;
+            }
+        }
+        return count;
+    }
+
     public bool BuildWallSegment(Point start, bool horizontal)
     {
         if (!CanBuildWallSegment(start, horizontal))

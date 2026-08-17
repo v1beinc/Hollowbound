@@ -15,6 +15,7 @@ public enum AgentAction : byte
     Resting = 7,
     Building = 8,
     Dead = 9,
+    Digging = 10,
 }
 
 public sealed class AgentState

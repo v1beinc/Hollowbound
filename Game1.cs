@@ -11,7 +11,7 @@ public sealed class Game1 : Game
 {
     private const float MinimumTileSize = 8f;
     private readonly GraphicsDeviceManager _graphics;
-    private readonly EmergentSimulationWorld _world = new(seed: Random.Shared.Next(1, int.MaxValue), initialPopulation: 2);
+    private EmergentSimulationWorld _world = new(seed: Random.Shared.Next(1, int.MaxValue), initialPopulation: 2);
     private SpriteBatch _spriteBatch = null!;
     private Texture2D _pixel = null!;
     private KeyboardState _previousKeyboard;
@@ -54,6 +54,9 @@ public sealed class Game1 : Game
         if (IsPressed(keyboard, Keys.Space))
             _paused = !_paused;
 
+        if (IsPressed(keyboard, Keys.N))
+            ResetWorld();
+
         if (IsPressed(keyboard, Keys.F11) ||
             (IsPressed(keyboard, Keys.Enter) && (keyboard.IsKeyDown(Keys.LeftAlt) || keyboard.IsKeyDown(Keys.RightAlt))))
             ToggleFullscreen();
@@ -63,9 +66,12 @@ public sealed class Game1 : Game
             _timeScale = _timeScale switch
             {
                 1f => 5f,
-                5f => 25f,
-                25f => 100f,
-                100f => 500f,
+                5f => 10f,
+                10f => 25f,
+                25f => 50f,
+                50f => 100f,
+                100f => 250f,
+                250f => 500f,
                 _ => 1f,
             };
         }
@@ -167,12 +173,12 @@ public sealed class Game1 : Game
     private void DrawInterface()
     {
         var viewport = GraphicsDevice.Viewport;
-        DrawRect(new Rectangle(18, 16, Math.Min(viewport.Width - 36, 900), 82), new Color(8, 10, 13, 225));
+        DrawRect(new Rectangle(18, 16, Math.Min(viewport.Width - 36, 1100), 82), new Color(8, 10, 13, 225));
         var alive = _world.Agents.Count(agent => agent.Alive);
         var header = $"HOLLOWBOUND  //  tick {_world.Tick:N0}  //  population {alive:N0}  //  seed {_world.Seed}";
-        var stats = $"food {_world.FoodStockpile:N0}   wall blocks {_world.Map.WallCells.Count:N0}   births {_world.Births:N0}   deaths {_world.Deaths:N0}   speed x{_timeScale:0}";
+        var stats = $"food {_world.FoodStockpile:N0}   wall blocks {_world.Map.WallCells.Count:N0}   passages {_world.WallBlocksRemoved:N0}   births {_world.Births:N0}   deaths {_world.Deaths:N0}   speed x{_timeScale:0}";
         var catchingUp = _world.IsCatchingUp ? "   CATCHING UP" : "";
-        var controls = $"[SPACE] {(_paused ? "resume" : "pause")}   [TAB] speed   [F11] fullscreen   [LMB] inspect";
+        var controls = $"[SPACE] {(_paused ? "resume" : "pause")}   [TAB] speed   [N] new seed   [F11] fullscreen   [LMB] inspect";
         DrawText(header, new Vector2(30, 26), new Color(218, 218, 203));
         DrawText(stats + catchingUp, new Vector2(30, 47), new Color(152, 162, 171));
         DrawText(controls, new Vector2(30, 68), new Color(111, 128, 137));
@@ -259,6 +265,14 @@ public sealed class Game1 : Game
 
         _graphics.ApplyChanges();
         _isFullscreen = _graphics.IsFullScreen;
+    }
+
+    private void ResetWorld()
+    {
+        _world = new EmergentSimulationWorld(Random.Shared.Next(1, int.MaxValue), initialPopulation: 2);
+        _timeScale = 1f;
+        _paused = false;
+        _selectedAgentId = -1;
     }
 
     private void DrawRect(Rectangle rectangle, Color color, int border = 0)

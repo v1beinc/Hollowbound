@@ -13,19 +13,19 @@ public sealed class EmergentSimulationWorld
     public const float TickLength = 0.1f;
     public const int MaxStepsPerFrame = 20;
     public const float MaxBacklogSeconds = 2f;
-    public const double MaxSimulationMillisecondsPerFrame = 6d;
+    public const double MaxSimulationMillisecondsPerFrame = 5d;
     public const float WallBuildEnergyCost = 22f;
     public const int MaxWallCells = 220;
 
     private readonly Random _rng;
     private readonly List<ResourceNode> _food = new();
+    private readonly Dictionary<Point, ResourceNode> _foodByCell = new();
     private readonly List<AgentState> _agents = new();
     private readonly Dictionary<Point, int> _foodStorage = new();
     private readonly Map _map;
     private readonly PathFinder _pathFinder;
     private float _accumulator;
     private int _nextAgentId;
-    private int _wallBuildAttempts;
     private float _birthCooldown;
 
     public IReadOnlyList<AgentState> Agents => _agents;
@@ -36,6 +36,7 @@ public sealed class EmergentSimulationWorld
     public int Births { get; private set; }
     public int Deaths { get; private set; }
     public int WallBlocksBuilt { get; private set; }
+    public int WallBlocksRemoved { get; private set; }
     public long Tick { get; private set; }
     public int Seed { get; }
     public bool IsCatchingUp { get; private set; }
@@ -59,10 +60,12 @@ public sealed class EmergentSimulationWorld
             MaxBacklogSeconds);
 
         var stopwatch = Stopwatch.StartNew();
+        var maxSteps = GetMaxStepsPerFrame(timeScale);
+        var maxMilliseconds = GetSimulationBudgetMilliseconds(timeScale);
         var steps = 0;
         while (_accumulator >= TickLength &&
-               steps < MaxStepsPerFrame &&
-               stopwatch.Elapsed.TotalMilliseconds < MaxSimulationMillisecondsPerFrame)
+               steps < maxSteps &&
+               stopwatch.Elapsed.TotalMilliseconds < maxMilliseconds)
         {
             Step(TickLength);
             _accumulator -= TickLength;
@@ -71,6 +74,24 @@ public sealed class EmergentSimulationWorld
 
         IsCatchingUp = _accumulator >= TickLength;
     }
+
+    private static int GetMaxStepsPerFrame(float timeScale) => timeScale switch
+    {
+        >= 500f => 5,
+        >= 100f => 8,
+        >= 25f => 12,
+        >= 5f => 18,
+        _ => MaxStepsPerFrame,
+    };
+
+    private static double GetSimulationBudgetMilliseconds(float timeScale) => timeScale switch
+    {
+        >= 500f => 1.5d,
+        >= 100f => 2d,
+        >= 25f => 3d,
+        >= 5f => 4d,
+        _ => MaxSimulationMillisecondsPerFrame,
+    };
 
     private void Step(float dt)
     {
@@ -121,6 +142,10 @@ public sealed class EmergentSimulationWorld
                     agent.Action = AgentAction.ReturningToWall;
                     SetPathToNearestWall(agent);
                 }
+                else if (TryOpenPassage(agent))
+                {
+                    break;
+                }
                 else if (!TryStartBuilding(agent))
                 {
                     agent.Action = AgentAction.SearchingFood;
@@ -135,6 +160,10 @@ public sealed class EmergentSimulationWorld
                 {
                     agent.Action = AgentAction.ReturningToWall;
                     SetPathToNearestWall(agent);
+                }
+                else if (TryOpenPassage(agent))
+                {
+                    break;
                 }
                 else if (!TryStartBuilding(agent))
                 {
@@ -220,6 +249,10 @@ public sealed class EmergentSimulationWorld
             case AgentAction.Building:
                 // The segment was placed when the action started.
                 break;
+
+            case AgentAction.Digging:
+                // A short rest follows opening a passage through a wall.
+                break;
         }
     }
 
@@ -297,6 +330,12 @@ public sealed class EmergentSimulationWorld
             agent.Action = AgentAction.Resting;
             agent.RestTimer = 3f;
         }
+
+        if (agent.Action == AgentAction.Digging)
+        {
+            agent.Action = AgentAction.Resting;
+            agent.RestTimer = 2f;
+        }
     }
 
     private bool TryStartBuilding(AgentState agent)
@@ -338,26 +377,87 @@ public sealed class EmergentSimulationWorld
             }
         }
 
-        var offset = (agent.PreferredBuildDirection + _wallBuildAttempts++ + _rng.Next(candidates.Count)) % candidates.Count;
-        for (var i = 0; i < candidates.Count; i++)
+        var scored = new List<(Point Cell, int Score)>();
+        var hasWalls = _map.WallCells.Count > 0;
+        foreach (var candidate in candidates)
         {
-            var candidate = candidates[(i + offset) % candidates.Count];
             if (!CanBuildAt(candidate))
                 continue;
 
-            _map.BuildWallCell(candidate);
-            agent.Energy -= WallBuildEnergyCost;
-            agent.BuildCooldown = 4f;
-            agent.Action = AgentAction.Building;
-            agent.Path.Clear();
-            agent.PathIndex = 0;
-            agent.HomeWallCell = candidate;
-            agent.HasHomeWall = true;
-            WallBlocksBuilt++;
-            return true;
+            var adjacentWalls = _map.CountAdjacentWalls(candidate);
+            if (hasWalls && adjacentWalls == 0 && agent.ExplorationDrive < 0.8f)
+                continue;
+
+            var horizontalExtension = IsWall(candidate.X - 1, candidate.Y) || IsWall(candidate.X + 1, candidate.Y);
+            var verticalExtension = IsWall(candidate.X, candidate.Y - 1) || IsWall(candidate.X, candidate.Y + 1);
+            var score = adjacentWalls * 10;
+            if (horizontalExtension)
+                score += 24;
+            if (verticalExtension)
+                score += 24;
+            if (adjacentWalls >= 4)
+                score -= 90;
+            score += _rng.Next(0, 14) + agent.PreferredBuildDirection;
+            scored.Add((candidate, score));
         }
 
-        return false;
+        if (scored.Count == 0)
+            return false;
+
+        scored.Sort((left, right) => right.Score.CompareTo(left.Score));
+        var choiceCount = Math.Min(scored.Count, 1 + (int)MathF.Round(agent.ExplorationDrive * 3f));
+        var chosen = scored[_rng.Next(choiceCount)].Cell;
+        if (!CanBuildAt(chosen))
+            return false;
+
+        _map.BuildWallCell(chosen);
+        agent.Energy -= WallBuildEnergyCost;
+        agent.BuildCooldown = 4f;
+        agent.Action = AgentAction.Building;
+        agent.Path.Clear();
+        agent.PathIndex = 0;
+        agent.HomeWallCell = chosen;
+        agent.HasHomeWall = true;
+        WallBlocksBuilt++;
+        return true;
+    }
+
+    private bool IsWall(int x, int y) => _map.InBounds(x, y) && _map[x, y] == CellType.Wall;
+
+    private bool TryOpenPassage(AgentState agent)
+    {
+        if (agent.Energy < 20f || !_map.IsNearWall(agent.Cell) || agent.ExplorationDrive < 0.35f ||
+            _rng.NextDouble() > 0.03 + agent.ExplorationDrive * 0.08)
+            return false;
+
+        var candidates = new List<Point>();
+        for (var dy = -1; dy <= 1; dy++)
+        {
+            for (var dx = -1; dx <= 1; dx++)
+            {
+                var wall = new Point(agent.Cell.X + dx, agent.Cell.Y + dy);
+                if (!_map.InBounds(wall) || _map[wall] != CellType.Wall)
+                    continue;
+                var neighbors = _map.CountAdjacentWalls(wall);
+                if (neighbors >= 2 && neighbors <= 4)
+                    candidates.Add(wall);
+            }
+        }
+
+        if (candidates.Count == 0)
+            return false;
+
+        var chosen = candidates[_rng.Next(candidates.Count)];
+        if (!_map.RemoveWallCell(chosen))
+            return false;
+
+        agent.Energy = MathF.Max(0, agent.Energy - 8f);
+        agent.BuildCooldown = 3f;
+        agent.Action = AgentAction.Digging;
+        agent.Path.Clear();
+        agent.PathIndex = 0;
+        WallBlocksRemoved++;
+        return true;
     }
 
     private bool CanBuildAt(Point cell)
@@ -523,7 +623,7 @@ public sealed class EmergentSimulationWorld
                 break;
 
             occupied.Add(cell.Value);
-            _food.Add(new ResourceNode { Cell = cell.Value, Amount = _rng.Next(2, 7) });
+            AddFoodNode(cell.Value, _rng.Next(2, 7));
         }
     }
 
@@ -535,7 +635,20 @@ public sealed class EmergentSimulationWorld
         var occupied = new HashSet<Point>(_food.Where(n => n.Amount > 0).Select(n => n.Cell));
         var cell = FindRandomFloorCell(occupied);
         if (cell.HasValue)
-            _food.Add(new ResourceNode { Cell = cell.Value, Amount = 4 });
+            AddFoodNode(cell.Value, 4);
+    }
+
+    private void AddFoodNode(Point cell, int amount)
+    {
+        if (_foodByCell.TryGetValue(cell, out var existing))
+        {
+            existing.Amount += amount;
+            return;
+        }
+
+        var node = new ResourceNode { Cell = cell, Amount = amount };
+        _food.Add(node);
+        _foodByCell[cell] = node;
     }
 
     private Point? FindRandomFloorCell(HashSet<Point> occupied)
@@ -614,12 +727,6 @@ public sealed class EmergentSimulationWorld
 
     private ResourceNode? FindFoodAt(Point cell)
     {
-        foreach (var node in _food)
-        {
-            if (node.Amount > 0 && node.Cell == cell)
-                return node;
-        }
-
-        return null;
+        return _foodByCell.TryGetValue(cell, out var node) && node.Amount > 0 ? node : null;
     }
 }
