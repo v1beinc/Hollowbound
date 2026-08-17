@@ -9,8 +9,7 @@ namespace Hollowbound;
 
 public sealed class Game1 : Game
 {
-    private const float TileSize = 8f;
-    private const float AgentSize = 6f / 8f; // 6 pixels in world units
+    private const float MinimumTileSize = 8f;
     private readonly GraphicsDeviceManager _graphics;
     private readonly SimulationWorld _world = new(seed: 47291, initialPopulation: 2);
     private SpriteBatch _spriteBatch = null!;
@@ -19,6 +18,9 @@ public sealed class Game1 : Game
     private MouseState _previousMouse;
     private float _timeScale = 1f;
     private bool _paused;
+    private bool _isFullscreen;
+    private int _windowedWidth = 1280;
+    private int _windowedHeight = 720;
     private int _selectedAgentId = -1;
 
     public Game1()
@@ -51,6 +53,10 @@ public sealed class Game1 : Game
 
         if (IsPressed(keyboard, Keys.Space))
             _paused = !_paused;
+
+        if (IsPressed(keyboard, Keys.F11) ||
+            (IsPressed(keyboard, Keys.Enter) && (keyboard.IsKeyDown(Keys.LeftAlt) || keyboard.IsKeyDown(Keys.RightAlt))))
+            ToggleFullscreen();
 
         if (IsPressed(keyboard, Keys.Tab))
         {
@@ -88,83 +94,71 @@ public sealed class Game1 : Game
     private void DrawWorld()
     {
         var viewport = GraphicsDevice.Viewport;
-        var center = new Vector2(viewport.Width / 2f, viewport.Height / 2f);
-        var mapTopLeft = center - new Vector2(SimulationWorld.Width, SimulationWorld.Height) * TileSize / 2f;
-        var mapBounds = new Rectangle((int)mapTopLeft.X, (int)mapTopLeft.Y, (int)(SimulationWorld.Width * TileSize), (int)(SimulationWorld.Height * TileSize));
+        var tileSize = GetTileSize();
+        var mapTopLeft = GetMapTopLeft(tileSize);
+        var mapBounds = new Rectangle((int)mapTopLeft.X, (int)mapTopLeft.Y, (int)(SimulationWorld.Width * tileSize), (int)(SimulationWorld.Height * tileSize));
         DrawRect(mapBounds, new Color(22, 27, 34));
 
         for (var x = 0; x < SimulationWorld.Width; x += 4)
-            DrawRect(new Rectangle((int)(mapTopLeft.X + x * TileSize), mapBounds.Top, 1, mapBounds.Height), new Color(28, 34, 42));
+            DrawRect(new Rectangle((int)(mapTopLeft.X + x * tileSize), mapBounds.Top, 1, mapBounds.Height), new Color(28, 34, 42));
         for (var y = 0; y < SimulationWorld.Height; y += 4)
-            DrawRect(new Rectangle(mapBounds.Left, (int)(mapTopLeft.Y + y * TileSize), mapBounds.Width, 1), new Color(28, 34, 42));
+            DrawRect(new Rectangle(mapBounds.Left, (int)(mapTopLeft.Y + y * tileSize), mapBounds.Width, 1), new Color(28, 34, 42));
+
+        foreach (var wall in _world.Map.WallCells)
+        {
+            var rect = CellRect(wall, tileSize, mapTopLeft);
+            DrawRect(rect, new Color(124, 132, 144));
+            DrawRect(new Rectangle(rect.Left, rect.Top, rect.Width, Math.Max(1, (int)(tileSize * 0.16f))), new Color(178, 184, 194));
+        }
+
+        foreach (var door in _world.Map.DoorCells)
+        {
+            var rect = CellRect(door, tileSize, mapTopLeft);
+            DrawRect(rect, new Color(49, 107, 82));
+            DrawRect(new Rectangle(rect.Left + rect.Width / 4, rect.Top + rect.Height / 4, Math.Max(1, rect.Width / 2), Math.Max(1, rect.Height / 2)), new Color(129, 193, 137));
+        }
+
+        foreach (var storage in _world.Map.StorageCells)
+        {
+            var rect = CellRect(storage, tileSize, mapTopLeft);
+            DrawRect(rect, new Color(31, 39, 43));
+            DrawRect(new Rectangle(rect.Left + rect.Width / 3, rect.Top + rect.Height / 3, Math.Max(1, rect.Width / 3), Math.Max(1, rect.Height / 3)), new Color(90, 72, 45));
+        }
 
         foreach (var node in _world.Food)
         {
             if (node.Amount <= 0)
                 continue;
-            var size = node.Amount >= 5 ? 4 : 3;
-            DrawWorldRect(node.Position, new Vector2(size / TileSize, size / TileSize), new Color(161, 125, 61));
+            var rect = CellRect(node.Cell, tileSize, mapTopLeft);
+            var size = node.Amount >= 5 ? Math.Max(3, (int)(tileSize * 0.38f)) : Math.Max(2, (int)(tileSize * 0.28f));
+            DrawRect(new Rectangle(rect.Center.X - size / 2, rect.Center.Y - size / 2, size, size), new Color(190, 145, 67));
         }
-
-        DrawShelter();
 
         foreach (var agent in _world.Agents)
         {
             if (!agent.Alive)
                 continue;
             var factionColor = agent.FactionId == 0 ? new Color(84, 161, 174) : new Color(181, 116, 72);
-            var borderColor = new Color(20, 24, 30);
-            DrawWorldRect(agent.Position, new Vector2(AgentSize, AgentSize), factionColor);
-            DrawWorldRectBorder(agent.Position, new Vector2(AgentSize, AgentSize), borderColor, 1);
+            var rect = CellRect(agent.Cell, tileSize, mapTopLeft);
+            var size = Math.Max(6, (int)(tileSize * 0.72f));
+            var agentRect = new Rectangle(rect.Center.X - size / 2, rect.Center.Y - size / 2, size, size);
+            DrawRect(agentRect, factionColor);
+            DrawRect(agentRect, new Color(18, 22, 28), 1);
 
             if (agent.Id == _selectedAgentId)
-            {
-                var screen = WorldToScreen(agent.Position);
-                var rect = new Rectangle((int)screen.X - 4, (int)screen.Y - 4, (int)(AgentSize * TileSize) + 8, (int)(AgentSize * TileSize) + 8);
-                DrawRect(rect, new Color(228, 220, 163), 2);
-            }
-        }
-    }
-
-    private void DrawShelter()
-    {
-        var shelter = _world.Shelter;
-        var wallColor = new Color(140, 145, 155);
-        var wallHighlight = new Color(180, 185, 195);
-        const float wall = 0.75f;
-        var top = new Vector2(shelter.X, shelter.Y);
-        var left = new Vector2(shelter.X, shelter.Y);
-        var right = new Vector2(shelter.Right - wall, shelter.Y);
-        var bottom = new Vector2(shelter.X, shelter.Bottom - wall);
-
-        DrawWorldRect(top, new Vector2(shelter.Width, wall), wallColor);
-        DrawWorldRect(left, new Vector2(wall, shelter.Height), wallColor);
-        DrawWorldRect(right, new Vector2(wall, shelter.Height), wallColor);
-
-        DrawWorldRect(bottom, new Vector2(6f, wall), wallColor);
-        DrawWorldRect(new Vector2(shelter.Right - 6f, shelter.Bottom - wall), new Vector2(6f, wall), wallColor);
-
-        const float highlight = 0.15f;
-        DrawWorldRect(new Vector2(shelter.X, shelter.Y + 0.1f), new Vector2(shelter.Width, highlight), wallHighlight);
-        DrawWorldRect(new Vector2(shelter.X + 0.1f, shelter.Y), new Vector2(highlight, shelter.Height), wallHighlight);
-        DrawWorldRect(new Vector2(shelter.Right - wall - 0.1f, shelter.Y), new Vector2(highlight, shelter.Height), wallHighlight);
-
-        var storedFood = Math.Min(16, _world.FoodStockpile);
-        for (var i = 0; i < storedFood; i++)
-        {
-            var storagePosition = new Vector2(shelter.X + 2 + i % 4, shelter.Y + 2 + i / 4);
-            DrawWorldRect(storagePosition, new Vector2(0.45f, 0.45f), new Color(190, 145, 67));
+                DrawRect(new Rectangle(agentRect.Left - 3, agentRect.Top - 3, agentRect.Width + 6, agentRect.Height + 6), new Color(228, 220, 163), 2);
         }
     }
 
     private void DrawInterface()
     {
-        DrawRect(new Rectangle(18, 16, 760, 76), new Color(8, 10, 13, 225));
+        var viewport = GraphicsDevice.Viewport;
+        DrawRect(new Rectangle(18, 16, Math.Min(viewport.Width - 36, 900), 82), new Color(8, 10, 13, 225));
         var alive = _world.Agents.Count(agent => agent.Alive);
         var header = $"HOLLOWBOUND  //  tick {_world.Tick:N0}  //  population {alive:N0}  //  seed {_world.Seed}";
         var stats = $"food {_world.FoodStockpile:N0}   births {_world.Births:N0}   deaths {_world.Deaths:N0}   speed x{_timeScale:0}";
         var catchingUp = _world.IsCatchingUp ? "   CATCHING UP" : "";
-        var controls = $"[SPACE] {(_paused ? "resume" : "pause")}   [TAB] speed   [LMB] inspect agent";
+        var controls = $"[SPACE] {(_paused ? "resume" : "pause")}   [TAB] speed   [F11] fullscreen   [LMB] inspect";
         DrawText(header, new Vector2(30, 26), new Color(218, 218, 203));
         DrawText(stats + catchingUp, new Vector2(30, 47), new Color(152, 162, 171));
         DrawText(controls, new Vector2(30, 68), new Color(111, 128, 137));
@@ -181,41 +175,75 @@ public sealed class Game1 : Game
         }
 
         if (_paused)
-            DrawText("PAUSED", new Vector2(1160, 24), new Color(228, 220, 163));
+            DrawText("PAUSED", new Vector2(Math.Max(18, viewport.Width - 110), 24), new Color(228, 220, 163));
     }
 
     private void SelectAgent(Point mousePosition)
     {
-        var viewport = GraphicsDevice.Viewport;
-        var center = new Vector2(viewport.Width / 2f, viewport.Height / 2f);
-        var mapTopLeft = center - new Vector2(SimulationWorld.Width, SimulationWorld.Height) * TileSize / 2f;
-        var worldPosition = (mousePosition.ToVector2() - mapTopLeft) / TileSize;
+        var tileSize = GetTileSize();
+        var mapTopLeft = GetMapTopLeft(tileSize);
+        var cell = ScreenToCell(mousePosition, tileSize, mapTopLeft);
+        if (!_world.Map.InBounds(cell))
+        {
+            _selectedAgentId = -1;
+            return;
+        }
+
         var nearest = _world.Agents
             .Where(agent => agent.Alive)
-            .OrderBy(agent => Vector2.DistanceSquared(agent.Position, worldPosition))
+            .OrderBy(agent => Math.Abs(agent.Cell.X - cell.X) + Math.Abs(agent.Cell.Y - cell.Y))
             .FirstOrDefault();
 
-        _selectedAgentId = nearest is not null && Vector2.Distance(nearest.Position, worldPosition) <= 1.5f ? nearest.Id : -1;
+        _selectedAgentId = nearest is not null && Math.Abs(nearest.Cell.X - cell.X) <= 1 && Math.Abs(nearest.Cell.Y - cell.Y) <= 1
+            ? nearest.Id
+            : -1;
     }
 
-    private Vector2 WorldToScreen(Vector2 worldPosition)
+    private float GetTileSize()
     {
         var viewport = GraphicsDevice.Viewport;
-        var center = new Vector2(viewport.Width / 2f, viewport.Height / 2f);
-        return center + (worldPosition - new Vector2(SimulationWorld.Width, SimulationWorld.Height) / 2f) * TileSize;
+        var widthScale = (viewport.Width - 40f) / SimulationWorld.Width;
+        var heightScale = (viewport.Height - 40f) / SimulationWorld.Height;
+        return MathF.Max(MinimumTileSize, MathF.Min(widthScale, heightScale));
     }
 
-    private void DrawWorldRect(Vector2 position, Vector2 size, Color color)
+    private Vector2 GetMapTopLeft(float tileSize)
     {
-        var topLeft = WorldToScreen(position);
-        DrawRect(new Rectangle((int)topLeft.X, (int)topLeft.Y, Math.Max(1, (int)(size.X * TileSize)), Math.Max(1, (int)(size.Y * TileSize))), color);
+        var viewport = GraphicsDevice.Viewport;
+        var mapSize = new Vector2(SimulationWorld.Width * tileSize, SimulationWorld.Height * tileSize);
+        return new Vector2(viewport.Width, viewport.Height) / 2f - mapSize / 2f;
     }
 
-    private void DrawWorldRectBorder(Vector2 position, Vector2 size, Color color, int border)
+    private Rectangle CellRect(Point cell, float tileSize, Vector2 mapTopLeft)
     {
-        var topLeft = WorldToScreen(position);
-        var rect = new Rectangle((int)topLeft.X, (int)topLeft.Y, Math.Max(1, (int)(size.X * TileSize)), Math.Max(1, (int)(size.Y * TileSize)));
-        DrawRect(rect, color, border);
+        return new Rectangle((int)(mapTopLeft.X + cell.X * tileSize), (int)(mapTopLeft.Y + cell.Y * tileSize), Math.Max(1, (int)MathF.Ceiling(tileSize)), Math.Max(1, (int)MathF.Ceiling(tileSize)));
+    }
+
+    private Point ScreenToCell(Point screen, float tileSize, Vector2 mapTopLeft)
+    {
+        return new Point((int)MathF.Floor((screen.X - mapTopLeft.X) / tileSize), (int)MathF.Floor((screen.Y - mapTopLeft.Y) / tileSize));
+    }
+
+    private void ToggleFullscreen()
+    {
+        if (!_isFullscreen)
+        {
+            _windowedWidth = Math.Max(640, Window.ClientBounds.Width);
+            _windowedHeight = Math.Max(360, Window.ClientBounds.Height);
+            var display = GraphicsDevice.Adapter.CurrentDisplayMode;
+            _graphics.PreferredBackBufferWidth = display.Width;
+            _graphics.PreferredBackBufferHeight = display.Height;
+            _graphics.IsFullScreen = true;
+        }
+        else
+        {
+            _graphics.IsFullScreen = false;
+            _graphics.PreferredBackBufferWidth = _windowedWidth;
+            _graphics.PreferredBackBufferHeight = _windowedHeight;
+        }
+
+        _graphics.ApplyChanges();
+        _isFullscreen = _graphics.IsFullScreen;
     }
 
     private void DrawRect(Rectangle rectangle, Color color, int border = 0)

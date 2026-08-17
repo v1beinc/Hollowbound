@@ -7,7 +7,7 @@ namespace Hollowbound.Simulation;
 
 public sealed class ResourceNode
 {
-    public Vector2 Position { get; init; }
+    public Point Cell { get; init; }
     public int Amount { get; set; }
 }
 
@@ -22,12 +22,15 @@ public sealed class SimulationWorld
     private readonly Random _rng;
     private readonly List<ResourceNode> _food = new();
     private readonly List<AgentState> _agents = new();
+    private readonly Map _map;
+    private readonly PathFinder _pathFinder;
     private float _accumulator;
     private int _nextAgentId;
 
     public IReadOnlyList<AgentState> Agents => _agents;
     public IReadOnlyList<ResourceNode> Food => _food;
-    public Rectangle Shelter { get; } = new(Width / 2 - 9, Height / 2 - 6, 18, 12);
+    public Rectangle Shelter { get; }
+    public Map Map => _map;
     public int FoodStockpile { get; private set; } = 30;
     public int Births { get; private set; }
     public int Deaths { get; private set; }
@@ -35,10 +38,17 @@ public sealed class SimulationWorld
     public int Seed { get; }
     public bool IsCatchingUp { get; private set; }
 
-    public SimulationWorld(int seed, int initialPopulation = 40)
+    public SimulationWorld(int seed, int initialPopulation = 2)
     {
         Seed = seed;
         _rng = new Random(seed);
+        _map = new Map(Width, Height);
+        _pathFinder = new PathFinder(_map);
+
+        var shelterBounds = new Rectangle(Width / 2 - 9, Height / 2 - 6, 18, 12);
+        Shelter = shelterBounds;
+        _map.InitializeShelter(shelterBounds);
+
         GenerateFood();
         GenerateAgents(initialPopulation);
     }
@@ -69,47 +79,23 @@ public sealed class SimulationWorld
             agent.Age += dt;
             agent.Energy -= dt * 0.035f;
             agent.MoveCooldown = MathF.Max(0, agent.MoveCooldown - dt);
+            agent.RestTimer = MathF.Max(0, agent.RestTimer - dt);
 
             if (agent.Energy <= 0)
             {
                 agent.Energy = 0;
                 agent.Alive = false;
-                agent.Action = "dead";
+                agent.Action = AgentAction.Dead;
                 Deaths++;
                 continue;
             }
 
-            if (agent.CarriedFood > 0 && (agent.CarriedFood >= 3 || agent.Energy < 65))
-            {
-                agent.Target = ShelterCenter();
-                agent.Action = "returning";
-            }
-            else if (agent.Energy < 55)
-            {
-                var target = FindNearestFood(agent.Position);
-                if (target is not null)
-                {
-                    agent.Target = target.Position;
-                    agent.Action = "foraging";
-                }
-            }
-            else if (agent.CarriedFood == 0 && Distance(agent.Position, ShelterCenter()) < 4)
-            {
-                var target = FindNearestFood(agent.Position);
-                if (target is not null)
-                {
-                    agent.Target = target.Position;
-                    agent.Action = "foraging";
-                }
-            }
-            else if (Distance(agent.Position, ShelterCenter()) < 2)
-            {
-                agent.Action = "resting";
-                agent.Target = ShelterCenter();
-            }
-
-            Move(agent, dt);
+            UpdateAgentState(agent);
+            MoveAgent(agent, dt);
             ResolveAction(agent);
+
+            if (agent.Action == AgentAction.Resting && _map.IsStorage(agent.Cell))
+                agent.Energy = MathF.Min(100, agent.Energy + dt * 1.5f);
         }
 
         TryBirth();
@@ -117,42 +103,179 @@ public sealed class SimulationWorld
             RegrowFood();
     }
 
-    private void Move(AgentState agent, float dt)
+    private void UpdateAgentState(AgentState agent)
+    {
+        switch (agent.Action)
+        {
+            case AgentAction.Idle:
+                if (agent.CarriedFood > 0)
+                {
+                    agent.Action = AgentAction.ReturningHome;
+                    SetPathToNearestDoor(agent);
+                }
+                else
+                {
+                    agent.Action = AgentAction.SearchingFood;
+                }
+                break;
+
+            case AgentAction.Resting:
+                if (agent.RestTimer > 0)
+                    break;
+
+                if (agent.CarriedFood > 0)
+                {
+                    agent.Action = AgentAction.ReturningHome;
+                    SetPathToNearestDoor(agent);
+                }
+                else if (agent.Energy < 55)
+                {
+                    agent.Action = AgentAction.SearchingFood;
+                }
+                else
+                {
+                    agent.Action = AgentAction.SearchingFood;
+                }
+                break;
+
+            case AgentAction.SearchingFood:
+                var foodTarget = FindNearestFood(agent.Cell);
+                if (foodTarget.HasValue)
+                {
+                    agent.TargetCell = foodTarget.Value;
+                    agent.Action = AgentAction.GoingToFood;
+                    SetPath(agent, agent.TargetCell);
+                }
+                else
+                {
+                    agent.Action = AgentAction.Idle;
+                }
+                break;
+
+            case AgentAction.GoingToFood:
+                if (agent.Cell == agent.TargetCell)
+                {
+                    agent.Action = AgentAction.GatheringFood;
+                }
+                else if (agent.Path.Count == 0 || agent.PathIndex >= agent.Path.Count)
+                {
+                    agent.Action = AgentAction.SearchingFood;
+                }
+                break;
+
+            case AgentAction.GatheringFood:
+                var foodAtCell = FindFoodAt(agent.Cell);
+                if (foodAtCell is not null && foodAtCell.Amount > 0 && agent.CarriedFood < 3 && agent.Energy >= 65)
+                {
+                    break;
+                }
+
+                if (agent.CarriedFood > 0)
+                {
+                    agent.Action = AgentAction.ReturningHome;
+                    SetPathToNearestDoor(agent);
+                }
+                else
+                {
+                    agent.Action = AgentAction.SearchingFood;
+                }
+                break;
+
+            case AgentAction.CarryingFood:
+            case AgentAction.ReturningHome:
+                if (_map.IsDoor(agent.Cell))
+                {
+                    agent.Action = AgentAction.StoringFood;
+                }
+                else if (agent.Path.Count == 0 || agent.PathIndex >= agent.Path.Count)
+                {
+                    SetPathToNearestDoor(agent);
+                }
+                break;
+
+            case AgentAction.StoringFood:
+                if (!_map.IsDoor(agent.Cell))
+                {
+                    agent.Action = AgentAction.Resting;
+                    agent.TargetCell = _map.FindRandomStorageCell(_rng);
+                    SetPath(agent, agent.TargetCell);
+                }
+                break;
+        }
+    }
+
+    private void MoveAgent(AgentState agent, float dt)
     {
         if (agent.MoveCooldown > 0)
             return;
 
-        var delta = agent.Target - agent.Position;
-        if (delta.LengthSquared() < 0.25f)
+        if (agent.Path.Count == 0 || agent.PathIndex >= agent.Path.Count)
             return;
 
-        var step = new Vector2(MathF.Sign(delta.X), MathF.Sign(delta.Y));
-        agent.Position += step;
-        agent.Position = new Vector2(
-            MathHelper.Clamp(MathF.Round(agent.Position.X), 1, Width - 2),
-            MathHelper.Clamp(MathF.Round(agent.Position.Y), 1, Height - 2));
-        agent.MoveCooldown = agent.Action == "returning" ? 0.1f : 0.2f;
+        var nextCell = agent.Path[agent.PathIndex];
+        if (agent.Cell == nextCell)
+        {
+            agent.PathIndex++;
+            if (agent.PathIndex >= agent.Path.Count)
+                return;
+            nextCell = agent.Path[agent.PathIndex];
+        }
+
+        if (!_map.IsWalkable(nextCell))
+        {
+            agent.Path.Clear();
+            agent.PathIndex = 0;
+            return;
+        }
+
+        agent.Cell = nextCell;
+        agent.PathIndex++;
+        agent.MoveCooldown = agent.Action == AgentAction.ReturningHome ? 0.1f : 0.2f;
+    }
+
+    private void SetPath(AgentState agent, Point target)
+    {
+        agent.Path = _pathFinder.FindPath(agent.Cell, target);
+        agent.PathIndex = 0;
+        agent.TargetCell = target;
+    }
+
+    private void SetPathToNearestDoor(AgentState agent)
+    {
+        var door = _map.FindNearestDoor(agent.Cell);
+        if (_map.IsDoor(door))
+        {
+            SetPath(agent, door);
+        }
     }
 
     private void ResolveAction(AgentState agent)
     {
-        if (agent.Action == "foraging")
+        if (agent.Action == AgentAction.GatheringFood)
         {
-            var node = FindNearestFood(agent.Position, 1.1f);
+            var node = FindFoodAt(agent.Cell);
             if (node is not null && node.Amount > 0)
             {
                 var gathered = Math.Min(1, node.Amount);
                 node.Amount -= gathered;
                 agent.CarriedFood += gathered;
+                agent.Energy = MathF.Min(100, agent.Energy + 5);
             }
         }
 
-        if (agent.CarriedFood > 0 && InsideShelter(agent.Position))
+        if (agent.Action == AgentAction.StoringFood && _map.IsDoor(agent.Cell) && agent.CarriedFood > 0)
         {
             FoodStockpile += agent.CarriedFood;
             agent.CarriedFood = 0;
             agent.Energy = MathF.Min(100, agent.Energy + MathF.Min(12, FoodStockpile * 0.15f));
-            agent.Action = "resting";
+            agent.Action = AgentAction.Resting;
+            agent.RestTimer = 2f;
+            var storageCell = _map.FindNearestStorage(agent.Cell);
+            if (_map.IsStorage(storageCell))
+            {
+                agent.TargetCell = storageCell;
+                SetPath(agent, storageCell);
+            }
         }
     }
 
@@ -162,40 +285,37 @@ public sealed class SimulationWorld
         if (alive >= 250 || FoodStockpile < alive / 2 || _rng.NextDouble() > 0.012)
             return;
 
-        var parents = _agents.Where(a => a.Alive && InsideShelter(a.Position) && a.Energy > 70)
+        var parents = _agents.Where(a => a.Alive && _map.IsStorage(a.Cell) && a.Energy > 70)
             .Take(2).ToArray();
         if (parents.Length < 2)
             return;
 
         FoodStockpile = Math.Max(0, FoodStockpile - 2);
-        var center = ShelterCenter();
+        var spawnCell = _map.FindRandomStorageCell(_rng);
         _agents.Add(new AgentState
         {
             Id = _nextAgentId++,
             FactionId = parents[0].FactionId,
-            Position = new Vector2(
-                _rng.Next(Shelter.X + 2, Shelter.Right - 1),
-                _rng.Next(Shelter.Y + 2, Shelter.Bottom - 1)),
-            Target = center,
-            Action = "newborn",
+            Cell = spawnCell,
+            TargetCell = spawnCell,
+            Action = AgentAction.Resting,
+            RestTimer = 2f,
         });
         Births++;
     }
 
     private void GenerateAgents(int count)
     {
-        var center = ShelterCenter();
         for (var i = 0; i < count; i++)
         {
-            var position = new Vector2(
-                Shelter.X + 2 + i % Math.Max(1, Shelter.Width - 4),
-                Shelter.Y + 2 + (i / Math.Max(1, Shelter.Width - 4)) % Math.Max(1, Shelter.Height - 4));
+            var spawnCell = _map.FindRandomStorageCell(_rng);
             _agents.Add(new AgentState
             {
                 Id = _nextAgentId++,
                 FactionId = i < count / 2 ? 0 : 1,
-                Position = position,
-                Target = center,
+                Cell = spawnCell,
+                TargetCell = spawnCell,
+                Action = AgentAction.SearchingFood,
             });
         }
     }
@@ -204,10 +324,18 @@ public sealed class SimulationWorld
     {
         for (var i = 0; i < 180; i++)
         {
-            var position = new Vector2(_rng.Next(4, Width - 4), _rng.Next(4, Height - 4));
-            if (InsideShelter(position))
-                continue;
-            _food.Add(new ResourceNode { Position = position, Amount = _rng.Next(2, 7) });
+            Point cell;
+            int attempts = 0;
+            do
+            {
+                cell = new Point(_rng.Next(4, Width - 4), _rng.Next(4, Height - 4));
+                attempts++;
+            } while (_map.IsWalkable(cell) == false && attempts < 100);
+
+            if (_map.IsWalkable(cell) && !_map.IsStorage(cell) && !_map.IsDoor(cell))
+            {
+                _food.Add(new ResourceNode { Cell = cell, Amount = _rng.Next(2, 7) });
+            }
         }
     }
 
@@ -215,30 +343,46 @@ public sealed class SimulationWorld
     {
         if (_food.Count(n => n.Amount > 0) >= 220)
             return;
-        var position = new Vector2(_rng.Next(4, Width - 4), _rng.Next(4, Height - 4));
-        if (!InsideShelter(position))
-            _food.Add(new ResourceNode { Position = position, Amount = 4 });
+
+        Point cell;
+        int attempts = 0;
+        do
+        {
+            cell = new Point(_rng.Next(4, Width - 4), _rng.Next(4, Height - 4));
+            attempts++;
+        } while ((_map.IsWalkable(cell) == false || _map.IsStorage(cell) || _map.IsDoor(cell)) && attempts < 100);
+
+        if (_map.IsWalkable(cell) && !_map.IsStorage(cell) && !_map.IsDoor(cell))
+        {
+            _food.Add(new ResourceNode { Cell = cell, Amount = 4 });
+        }
     }
 
-    private ResourceNode? FindNearestFood(Vector2 position, float maxDistance = float.MaxValue)
+    private Point? FindNearestFood(Point from)
     {
-        ResourceNode? best = null;
-        var bestDistance = maxDistance;
+        Point? best = null;
+        int bestDist = int.MaxValue;
         foreach (var node in _food)
         {
             if (node.Amount <= 0)
                 continue;
-            var distance = Distance(position, node.Position);
-            if (distance < bestDistance)
+            int dist = Math.Abs(node.Cell.X - from.X) + Math.Abs(node.Cell.Y - from.Y);
+            if (dist < bestDist)
             {
-                best = node;
-                bestDistance = distance;
+                best = node.Cell;
+                bestDist = dist;
             }
         }
         return best;
     }
 
-    public Vector2 ShelterCenter() => new(Shelter.Center.X, Shelter.Center.Y);
-    public bool InsideShelter(Vector2 position) => Shelter.Contains(position.ToPoint());
-    private static float Distance(Vector2 a, Vector2 b) => Vector2.Distance(a, b);
+    private ResourceNode? FindFoodAt(Point cell)
+    {
+        foreach (var node in _food)
+        {
+            if (node.Amount > 0 && node.Cell == cell)
+                return node;
+        }
+        return null;
+    }
 }
