@@ -5,12 +5,13 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.Json;
+using System.Globalization;
 
 namespace Hollowbound.Simulation;
 
 public sealed class AnalyticsLogger : IDisposable
 {
-    public const int SchemaVersion = 2;
+    public const int SchemaVersion = 5;
 
     private readonly JsonSerializerOptions _jsonOptions = new();
     private readonly Stopwatch _sessionStopwatch = Stopwatch.StartNew();
@@ -24,9 +25,13 @@ public sealed class AnalyticsLogger : IDisposable
     private int _peakPopulation;
     private int _peakFoodStockpile;
     private int _peakWallBlocks;
+    private readonly Dictionary<string, string?> _savedWorldIdsByState = new(StringComparer.Ordinal);
+    private string _worldIdentitySource = "uninitialized";
 
     public string LogPath { get; }
     public string RunId { get; } = Guid.NewGuid().ToString("N");
+    public string WorldId { get; private set; } = string.Empty;
+    public string WorldSegmentId { get; private set; } = string.Empty;
     public DateTimeOffset StartedUtc { get; } = DateTimeOffset.UtcNow;
 
     public AnalyticsLogger()
@@ -58,17 +63,45 @@ public sealed class AnalyticsLogger : IDisposable
         }
     }
 
+    // Isolated temp-path constructor for deterministic regression checks. The
+    // normal game path remains local-app-data with its existing fallback.
+    internal AnalyticsLogger(string logPath)
+    {
+        LogPath = Path.GetFullPath(logPath);
+        Directory.CreateDirectory(Path.GetDirectoryName(LogPath)!);
+        _writer = new StreamWriter(LogPath, false, new UTF8Encoding(false), 16 * 1024);
+    }
+
     public void LogEvent(string kind, EmergentSimulationWorld world, float timeScale, bool paused, string? detail = null)
     {
+        if (kind == "run_started")
+            BeginWorldSegment(world, Guid.NewGuid().ToString("N"), "run_started");
+        else if (kind == "new_world")
+            BeginWorldSegment(world, Guid.NewGuid().ToString("N"), "new_world");
+        else if (kind == "loaded")
+            BeginLoadedWorldSegment(world);
+        else
+            EnsureWorldIdentity(world);
+
         if (kind is "run_started" or "new_world")
             _lastSnapshotTick = -1;
+
+        if (kind == "saved")
+            RememberSavedWorldIdentity(world);
+
         WriteRecord(kind, world, timeScale, paused, detail);
     }
 
     public void LogWorldEvents(EmergentSimulationWorld world)
     {
+        EnsureWorldIdentity(world);
         if (_writer is null)
+        {
+            // A failed/disabled file writer must not leave every Chronicle
+            // event queued in the live world indefinitely.
+            _ = world.DrainNewChronicleEvents();
             return;
+        }
 
         foreach (var evt in world.DrainNewChronicleEvents())
         {
@@ -79,8 +112,13 @@ public sealed class AnalyticsLogger : IDisposable
                     timestamp_utc = DateTimeOffset.UtcNow,
                     schema_version = SchemaVersion,
                     run_id = RunId,
+                    session_id = RunId,
+                    world_id = WorldId,
+                    world_segment_id = WorldSegmentId,
+                    identity_source = _worldIdentitySource,
                     kind = "world_event",
                     event_type = evt.Type.ToString(),
+                    seed = world.Seed,
                     tick = evt.Tick,
                     importance = evt.Importance.ToString(),
                     faction_id = evt.FactionId,
@@ -147,6 +185,7 @@ public sealed class AnalyticsLogger : IDisposable
         int viewportWidth,
         int viewportHeight)
     {
+        EnsureWorldIdentity(world);
         if (_writer is null)
             return;
 
@@ -158,6 +197,10 @@ public sealed class AnalyticsLogger : IDisposable
                 timestamp_utc = DateTimeOffset.UtcNow,
                 schema_version = SchemaVersion,
                 run_id = RunId,
+                session_id = RunId,
+                world_id = WorldId,
+                world_segment_id = WorldSegmentId,
+                identity_source = _worldIdentitySource,
                 kind = "render_metrics",
                 seed = world.Seed,
                 tick = world.Tick,
@@ -190,6 +233,7 @@ public sealed class AnalyticsLogger : IDisposable
 
     private void WriteRecord(string kind, EmergentSimulationWorld world, float timeScale, bool paused, string? detail)
     {
+        EnsureWorldIdentity(world);
         if (_writer is null)
             return;
 
@@ -197,11 +241,16 @@ public sealed class AnalyticsLogger : IDisposable
         {
             Observe(world);
             Count(_kindCounts, kind);
+            var stepProfile = world.StepPerformance;
             var record = new
             {
                 timestamp_utc = DateTimeOffset.UtcNow,
                 schema_version = SchemaVersion,
                 run_id = RunId,
+                session_id = RunId,
+                world_id = WorldId,
+                world_segment_id = WorldSegmentId,
+                identity_source = _worldIdentitySource,
                 kind,
                 detail,
                 seed = world.Seed,
@@ -216,6 +265,15 @@ public sealed class AnalyticsLogger : IDisposable
                 food_gathered = world.FoodGathered,
                 food_consumed = world.FoodConsumed,
                 colony_ecology = world.Ecology.Copy(),
+                bloom_food_harvested = world.BloomFoodHarvested,
+                beacon_exploration_starts = world.BeaconExplorationStarts,
+                beacon_arrivals = world.BeaconArrivals,
+                insight_agents_taught = world.InsightAgentsTaught,
+                insight_food_routes_started = world.InsightFoodRoutesStarted,
+                insight_food_arrivals = world.InsightFoodArrivals,
+                insight_food_harvested = world.InsightFoodHarvested,
+                passage_traversals = world.PassageTraversals,
+                player_passage_traversals = world.PlayerPassageTraversals,
                 food_shared = world.FoodShared,
                 knowledge_shared = world.KnowledgeShared,
                 stored_piles = world.FoodStorage.Count,
@@ -278,6 +336,14 @@ public sealed class AnalyticsLogger : IDisposable
                 distance_grid_requests = world.DistanceGridRequests,
                 last_steps_processed = world.LastStepsProcessed,
                 last_simulation_ms = Math.Round(world.LastSimulationMilliseconds, 3),
+                step_profile_interval_ticks = StepPerformanceProfiler.SampleIntervalTicks,
+                step_profile_samples = stepProfile.Total.Samples,
+                step_total_p50_ms = Math.Round(stepProfile.Total.P50Milliseconds, 3),
+                step_total_p95_ms = Math.Round(stepProfile.Total.P95Milliseconds, 3),
+                step_total_max_ms = Math.Round(stepProfile.Total.MaxMilliseconds, 3),
+                step_agents_p95_ms = Math.Round(stepProfile.AgentLoop.P95Milliseconds, 3),
+                step_distance_grid_prep_p95_ms = Math.Round(stepProfile.DistanceGridPreparation.P95Milliseconds, 3),
+                step_other_p95_ms = Math.Round(stepProfile.OtherWork.P95Milliseconds, 3),
                 catching_up_frames = world.CatchingUpFrames,
                 catching_up_duration_seconds = Math.Round(world.CatchingUpSeconds, 3),
                 effective_simulation_speed = Math.Round(world.LastEffectiveSimulationSpeed, 3),
@@ -338,6 +404,7 @@ public sealed class AnalyticsLogger : IDisposable
         if (_completed)
             return;
 
+        EnsureWorldIdentity(world);
         _completed = true;
         _sessionStopwatch.Stop();
         if (_writer is null)
@@ -353,7 +420,12 @@ public sealed class AnalyticsLogger : IDisposable
                 timestamp_utc = DateTimeOffset.UtcNow,
                 schema_version = SchemaVersion,
                 run_id = RunId,
+                session_id = RunId,
+                world_id = WorldId,
+                world_segment_id = WorldSegmentId,
+                identity_source = _worldIdentitySource,
                 kind = "session_summary",
+                summary_scope = "world_segment_at_session_close",
                 reason,
                 duration_seconds = Math.Round(_sessionStopwatch.Elapsed.TotalSeconds, 3),
                 seed = world.Seed,
@@ -378,6 +450,16 @@ public sealed class AnalyticsLogger : IDisposable
                 knowledge_shared = world.KnowledgeShared,
                 successful_interventions = world.SuccessfulInterventions,
                 failed_interventions = world.FailedInterventions,
+                bloom_food_harvested = world.BloomFoodHarvested,
+                beacon_exploration_starts = world.BeaconExplorationStarts,
+                beacon_arrivals = world.BeaconArrivals,
+                insight_agents_taught = world.InsightAgentsTaught,
+                insight_food_routes_started = world.InsightFoodRoutesStarted,
+                insight_food_arrivals = world.InsightFoodArrivals,
+                insight_food_harvested = world.InsightFoodHarvested,
+                passage_traversals = world.PassageTraversals,
+                player_passage_traversals = world.PlayerPassageTraversals,
+                total_resonance_spent = world.TotalResonanceSpent,
                 shouts_made = world.ShoutsMade,
                 shouts_heard = world.ShoutsHeard,
                 food_shouts = world.FoodShouts,
@@ -416,6 +498,57 @@ public sealed class AnalyticsLogger : IDisposable
         _peakFoodStockpile = Math.Max(_peakFoodStockpile, world.FoodStockpile);
         _peakWallBlocks = Math.Max(_peakWallBlocks, world.Map.WallCells.Count);
     }
+
+    private void BeginLoadedWorldSegment(EmergentSimulationWorld world)
+    {
+        var stateKey = GetWorldStateKey(world);
+        if (_savedWorldIdsByState.TryGetValue(stateKey, out var savedWorldId) && savedWorldId is not null)
+            BeginWorldSegment(world, savedWorldId, "saved_state_match");
+        else
+            BeginWorldSegment(world, Guid.NewGuid().ToString("N"),
+                _savedWorldIdsByState.ContainsKey(stateKey) ? "loaded_ambiguous_saved_state" : "loaded_unmatched");
+    }
+
+    private void BeginWorldSegment(EmergentSimulationWorld world, string worldId, string identitySource)
+    {
+        WorldId = worldId;
+        WorldSegmentId = Guid.NewGuid().ToString("N");
+        _worldIdentitySource = identitySource;
+        _lastSnapshotTick = -1;
+        _wasCatchingUp = world.IsCatchingUp;
+        // These counters are attached to a world_segment_id in the log. Do not
+        // carry peaks or event-kind totals across New World / Load boundaries.
+        _kindCounts.Clear();
+        _worldEventCounts.Clear();
+        _peakPopulation = world.AlivePopulation;
+        _peakFoodStockpile = world.FoodStockpile;
+        _peakWallBlocks = world.Map.WallCells.Count;
+    }
+
+    private void EnsureWorldIdentity(EmergentSimulationWorld world)
+    {
+        if (WorldId.Length == 0 || WorldSegmentId.Length == 0)
+            BeginWorldSegment(world, Guid.NewGuid().ToString("N"), "implicit_start");
+    }
+
+    private void RememberSavedWorldIdentity(EmergentSimulationWorld world)
+    {
+        var key = GetWorldStateKey(world);
+        if (_savedWorldIdsByState.TryGetValue(key, out var previous) && previous != WorldId)
+            _savedWorldIdsByState[key] = null; // Identical signatures from distinct worlds are ambiguous.
+        else
+            _savedWorldIdsByState[key] = WorldId;
+    }
+
+    private static string GetWorldStateKey(EmergentSimulationWorld world) => string.Join("|",
+        world.Seed.ToString(CultureInfo.InvariantCulture),
+        world.Tick.ToString(CultureInfo.InvariantCulture),
+        world.AlivePopulation.ToString(CultureInfo.InvariantCulture),
+        world.Births.ToString(CultureInfo.InvariantCulture),
+        world.Deaths.ToString(CultureInfo.InvariantCulture),
+        world.FoodStockpile.ToString(CultureInfo.InvariantCulture),
+        world.Map.WallCells.Count.ToString(CultureInfo.InvariantCulture),
+        world.StoredFoodUnits.ToString(CultureInfo.InvariantCulture));
 
     private static void Count(Dictionary<string, int> counts, string key)
     {

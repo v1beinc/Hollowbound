@@ -1,9 +1,54 @@
 # Changelog
 
-Этот файл описывает текущее **незакоммиченное** рабочее состояние. Это не Git tag
-и не обещание публичного релиза.
+Этот файл фиксирует pre-alpha историю изменений. Версии здесь не являются
+официальными релизными тегами или обещанием готового коммерческого релиза.
 
-## 0.4.0-prealpha — Living Colonies (2026-09-10, uncommitted)
+## 0.4.1-prealpha — First Cycle: Performance, Ecology & Impact (2026-09-28)
+
+### Performance and observability
+
+- Replaced broad per-agent BFS route searches with deterministic A* using a
+  Chebyshev heuristic, stable tie-breaking, and search stamps. Food lookup now
+  expands through 8×8 spatial chunks; resource registrations are incremental,
+  and reservation release uses direct cell lookup.
+- Equal-cost routes may differ from older builds because A* has a new stable
+  tie-break order; deterministic continuation is verified within the new build.
+- Added a bounded rolling simulation profiler for sampled agent-loop,
+  distance-grid, and remaining-step time. JSONL, F3 diagnostics, benchmark, and
+  `--analyze-log` report p50/p95 estimates and maxima; older log schemas report
+  unavailable metrics instead of misleading zeros.
+- Added camera-aware visual detail levels that reduce atmosphere, wall shading,
+  and entity/resource glow at overview zoom. This is presentation-only; an FPS
+  gain has not yet been measured in a post-patch GUI run.
+- One fixed headless before/after run measured 85.8→112.0 ticks/s (+30.5%), but
+  population and route outcomes differed. Treat this as a promising single-run
+  signal, not a stable hardware benchmark. At population ~300, responsiveness
+  tests still reached only about x7 at requested x500.
+
+### Gameplay and player feedback
+
+- Drought risk is contextual and seeded: it evaluates reachable food around a
+  rotating batch of settlements, gives an 800-tick warning, then applies a
+  local 1,800-tick depletion phase. Probability depends on local food pressure
+  and population; it is capped and not guaranteed on a fixed schedule.
+- Bloom, Beacon, Insight, and player-opened Passage now track observable
+  outcomes such as harvests, route starts/arrivals, and player-attributed
+  crossings. Empty Insight pulses are rejected without spending Resonance.
+  Score remains provisional and is not a competitive leaderboard rating.
+
+### Persistence and validation
+
+- Snapshot v24 persists intervention-impact provenance and counters; analytics
+  JSONL schema v5 separates world segments and exposes causal outcome fields.
+- Full DesktopGL/content build: 0 warnings, 0 errors. `--self-test all`: 15/15
+  pass including soak (12,000 ticks, 0 invariant errors), responsiveness (15
+  combinations, 0 stalls over 100 ms), profiler, pathfinder, resource-index,
+  ecology, interventions, persistence, and analytics. `--self-test multi-seed`:
+  100/100 seeds, 800 ticks each, 0 extinctions. `--test-camera-layout`: 23/23.
+- GUI FPS after this patch and drought balance across long multi-seed runs remain
+  unverified; see CHECKPOINT.md for the next validation gates.
+
+## 0.4.0-prealpha — Living Colonies (2026-09-10)
 
 ### Gameplay
 

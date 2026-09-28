@@ -1,6 +1,17 @@
 # Hollowbound
 
-## Living Colonies — 0.4.0-prealpha
+## The Living Archive — 0.4.1-prealpha
+
+Hollowbound is a deterministic colony-simulation sandbox: guide a living world
+through scarce, indirect interventions and watch its history emerge. This
+pre-alpha update adds deterministic A* routing, lower-cost resource lookup,
+simulation phase telemetry, camera-aware visual detail, contextual droughts, and
+measured outcomes for player interventions. It improves the foundation without
+claiming that requested x500 is achievable or that on-screen FPS gains are
+already proven. See [CHANGELOG.md](CHANGELOG.md) and [CHECKPOINT.md](CHECKPOINT.md)
+for validation and known limits.
+
+### Living Colonies — 0.4.0 foundation
 
 Локальное развитие теперь зависит от питания и доступных запасов. Сбор/складирование
 не дают бесплатной энергии; голодный житель ест переносимую еду или доступный запас
@@ -14,7 +25,7 @@ Space позволяет спокойно подготовить вмешате�
 блокировки роста. Это первая настройка баланса, не гарантия вечного роста популяции.
 Проверка механики: `dotnet run -- --self-test ecology`.
 
-### Основа: The Living Archive
+### Наблюдение и интерфейс
 
 Текущее локальное обновление: новый интерфейс наблюдателя, мини-карта, слои пищи/
 энергии/фракций, инспектор жителей, список колоний и вмешательство «Проход».

@@ -419,14 +419,28 @@ public sealed class Map
 
 public sealed class PathFinder
 {
+    private readonly record struct PathPriority(int TotalCost, int Heuristic, int CellIndex) : IComparable<PathPriority>
+    {
+        public int CompareTo(PathPriority other)
+        {
+            var result = TotalCost.CompareTo(other.TotalCost);
+            if (result != 0) return result;
+            result = Heuristic.CompareTo(other.Heuristic);
+            return result != 0 ? result : CellIndex.CompareTo(other.CellIndex);
+        }
+    }
+
     private readonly Map _map;
     private readonly int _width;
     private readonly int _height;
     private readonly int[] _cameFrom;
-    private readonly int[] _costSoFar;
-    private readonly bool[] _visited;
+    private readonly int[] _visitStamp;
+    private readonly int[] _closedStamp;
+    private readonly int[] _distanceFromStart;
     private readonly Queue<int> _queue = new();
+    private readonly PriorityQueue<int, PathPriority> _open = new(512);
     private readonly int[] _neighbors = new int[8];
+    private int _currentVisitStamp;
 
     // Path buffer reuse
     private readonly List<Point> _pathBuffer = new();
@@ -447,8 +461,9 @@ public sealed class PathFinder
         _height = map.Height;
         int size = _width * _height;
         _cameFrom = new int[size];
-        _costSoFar = new int[size];
-        _visited = new bool[size];
+        _visitStamp = new int[size];
+        _closedStamp = new int[size];
+        _distanceFromStart = new int[size];
     }
 
     public List<Point> FindPath(Point start, Point goal)
@@ -479,18 +494,35 @@ public sealed class PathFinder
             return new List<Point>(cachedPath);
         }
 
-        Array.Fill(_visited, false);
-        Array.Fill(_costSoFar, int.MaxValue);
-        Array.Fill(_cameFrom, -1);
-
-        _queue.Clear();
-        _queue.Enqueue(startIdx);
-        _visited[startIdx] = true;
-        _costSoFar[startIdx] = 0;
-
-        while (_queue.Count > 0)
+        // A* with an admissible Chebyshev heuristic explores the route corridor
+        // instead of filling the entire reachable map for every cache miss.
+        // Stamps avoid clearing map-sized search arrays between requests.
+        if (_currentVisitStamp == int.MaxValue)
         {
-            int current = _queue.Dequeue();
+            Array.Clear(_visitStamp);
+            Array.Clear(_closedStamp);
+            _currentVisitStamp = 0;
+        }
+        var visitStamp = ++_currentVisitStamp;
+
+        _open.Clear();
+        _visitStamp[startIdx] = visitStamp;
+        _distanceFromStart[startIdx] = 0;
+        var startHeuristic = GetHeuristic(startIdx, goal.X, goal.Y);
+        _open.Enqueue(startIdx, new PathPriority(startHeuristic, startHeuristic, startIdx));
+
+        while (_open.TryDequeue(out var current, out var priority))
+        {
+            if (_closedStamp[current] == visitStamp)
+                continue;
+
+            var currentCost = _distanceFromStart[current];
+            var currentHeuristic = GetHeuristic(current, goal.X, goal.Y);
+            if (priority.TotalCost != currentCost + currentHeuristic ||
+                priority.Heuristic != currentHeuristic || priority.CellIndex != current)
+                continue;
+
+            _closedStamp[current] = visitStamp;
             if (current == goalIdx)
                 break;
 
@@ -501,21 +533,22 @@ public sealed class PathFinder
             for (int i = 0; i < neighborCount; i++)
             {
                 int next = _neighbors[i];
-                if (_visited[next])
+                if (_closedStamp[next] == visitStamp)
                     continue;
 
-                int newCost = _costSoFar[current] + 1;
-                if (newCost < _costSoFar[next])
-                {
-                    _costSoFar[next] = newCost;
-                    _cameFrom[next] = current;
-                    _visited[next] = true;
-                    _queue.Enqueue(next);
-                }
+                var tentativeCost = currentCost + 1;
+                if (_visitStamp[next] == visitStamp && tentativeCost >= _distanceFromStart[next])
+                    continue;
+
+                var heuristic = GetHeuristic(next, goal.X, goal.Y);
+                _cameFrom[next] = current;
+                _distanceFromStart[next] = tentativeCost;
+                _visitStamp[next] = visitStamp;
+                _open.Enqueue(next, new PathPriority(tentativeCost + heuristic, heuristic, next));
             }
         }
 
-        if (!_visited[goalIdx])
+        if (_visitStamp[goalIdx] != visitStamp)
             return EmptyPath;
 
         // Build path in buffer
@@ -544,6 +577,13 @@ public sealed class PathFinder
         }
 
         return result;
+    }
+
+    private int GetHeuristic(int cellIndex, int goalX, int goalY)
+    {
+        var dx = Math.Abs(cellIndex % _width - goalX);
+        var dy = Math.Abs(cellIndex / _width - goalY);
+        return Math.Max(dx, dy);
     }
 
     private static List<Point> EmptyPath => new();

@@ -26,6 +26,7 @@ public sealed partial class Game1 : Game
     private int _windowedWidth = 1280;
     private int _windowedHeight = 720;
     private bool _windowModeTransition;
+    private bool _windowMinimumClampPending;
     private bool _screenshotRequested;
     private int _selectedAgentId = -1;
     private float _autosaveTimer;
@@ -96,7 +97,6 @@ public sealed partial class Game1 : Game
         Window.Title = "Hollowbound - The Living Archive";
         Window.AllowUserResizing = true;
         Window.ClientSizeChanged += OnClientSizeChanged;
-        _analytics.LogEvent("run_started", _world, _timeScale, _paused);
     }
 
     protected override void LoadContent()
@@ -115,6 +115,9 @@ public sealed partial class Game1 : Game
 
         // Phase 3-4: Initialize camera and layout
         UpdateLayoutAndCamera();
+        // Configuration helpers (preview/playtest) replace _world before Run;
+        // start the analytics segment only after that replacement is complete.
+        _analytics.LogEvent("run_started", _world, _timeScale, _paused);
         InitializeExperience();
     }
 
@@ -140,6 +143,7 @@ public sealed partial class Game1 : Game
 
     protected override void Update(GameTime gameTime)
     {
+        ApplyPendingWindowMinimum();
         var keyboard = Keyboard.GetState();
         var mouse = Mouse.GetState();
 
@@ -331,6 +335,9 @@ public sealed partial class Game1 : Game
 
         _drawStopwatch.Restart();
         DrawObservatory(gameTime);
+        // End the batch before sampling UI time so SpriteBatch's command flush
+        // is included in the UI metric rather than hidden after the log write.
+        _spriteBatch.End();
         _lastUIDrawTicks = _drawStopwatch.ElapsedTicks;
 
         _renderMetricsLogTimer += gameTime.ElapsedGameTime.TotalSeconds;
@@ -351,8 +358,6 @@ public sealed partial class Game1 : Game
                 _layout.WorldViewport.Height);
         }
 
-        _spriteBatch.End();
-
         if (_screenshotRequested)
         {
             _screenshotRequested = false;
@@ -367,6 +372,7 @@ public sealed partial class Game1 : Game
         var viewMatrix = _camera.GetViewMatrix();
         var visibleBounds = _camera.GetVisibleCellBounds();
         var tileSize = Camera2D.DefaultTileSize;
+        var renderProfile = WorldRenderProfile.Create(_camera.Zoom, visibleBounds);
 
         // Set scissor rectangle to clip world rendering to WorldViewport
         GraphicsDevice.ScissorRectangle = vp;
@@ -385,28 +391,32 @@ public sealed partial class Game1 : Game
             // Draw map background
             var mapBounds = new Rectangle(0, 0, EmergentSimulationWorld.Width * tileSize, EmergentSimulationWorld.Height * tileSize);
             DrawRect(mapBounds, new Color(22, 27, 34));
-            DrawAtmosphere(visibleBounds);
+            DrawAtmosphere(visibleBounds, renderProfile);
 
             // Grid lines (only visible area + margin)
             int startX = Math.Max(0, visibleBounds.Left - (visibleBounds.Left % 4));
             int endX = Math.Min(EmergentSimulationWorld.Width, visibleBounds.Right + 4);
             for (var x = startX; x < endX; x += 4)
-                if (_camera.Zoom >= 1.6f) DrawRect(new Rectangle(x * tileSize, 0, 1, mapBounds.Height), new Color(24, 33, 38));
+                if (renderProfile.FineGrid) DrawRect(new Rectangle(x * tileSize, 0, 1, mapBounds.Height), new Color(24, 33, 38));
 
             int startY = Math.Max(0, visibleBounds.Top - (visibleBounds.Top % 4));
             int endY = Math.Min(EmergentSimulationWorld.Height, visibleBounds.Bottom + 4);
             for (var y = startY; y < endY; y += 4)
-                if (_camera.Zoom >= 1.6f) DrawRect(new Rectangle(0, y * tileSize, mapBounds.Width, 1), new Color(24, 33, 38));
+                if (renderProfile.FineGrid) DrawRect(new Rectangle(0, y * tileSize, mapBounds.Width, 1), new Color(24, 33, 38));
 
             // Walls (only visible)
             foreach (var wall in _world.Map.WallCells)
             {
                 if (!visibleBounds.Contains(wall)) continue;
                 var rect = new Rectangle(wall.X * tileSize, wall.Y * tileSize, tileSize, tileSize);
-                DrawRect(new Rectangle(rect.X + 1, rect.Y + 2, 8, 8), new Color(6, 12, 17, 175));
                 DrawRect(rect, new Color(51, 66, 77));
-                DrawRect(new Rectangle(rect.Left, rect.Top, rect.Width, 1), new Color(102, 127, 139));
-                DrawRect(new Rectangle(rect.Left, rect.Top, 1, rect.Height), new Color(74, 94, 104));
+                if (renderProfile.WallDetail >= 1)
+                    DrawRect(new Rectangle(rect.Left, rect.Top, rect.Width, 1), new Color(102, 127, 139));
+                if (renderProfile.WallDetail >= 2)
+                {
+                    DrawRect(new Rectangle(rect.X + 1, rect.Y + 2, 8, 8), new Color(6, 12, 17, 175));
+                    DrawRect(new Rectangle(rect.Left, rect.Top, 1, rect.Height), new Color(74, 94, 104));
+                }
             }
 
             // Doors (only visible)
@@ -433,7 +443,8 @@ public sealed partial class Game1 : Game
                 if (node.Amount <= 0 || !visibleBounds.Contains(node.Cell)) continue;
                 var rect = new Rectangle(node.Cell.X * tileSize, node.Cell.Y * tileSize, tileSize, tileSize);
                 var size = node.Amount >= 5 ? Math.Max(3, (int)(tileSize * 0.38f)) : Math.Max(2, (int)(tileSize * 0.28f));
-                DrawGlow(new Vector2(rect.Center.X, rect.Center.Y), 14, new Color(223, 171, 78) * 0.3f);
+                if (renderProfile.ShouldGlowResources(_mapLens, _camera.Zoom) && node.Amount >= 3)
+                    DrawGlow(new Vector2(rect.Center.X, rect.Center.Y), 14, new Color(223, 171, 78) * 0.3f);
                 DrawRect(new Rectangle(rect.Center.X - size / 2, rect.Center.Y - size / 2, size, size), new Color(190, 145, 67));
             }
 
@@ -496,13 +507,17 @@ public sealed partial class Game1 : Game
                 var rect = new Rectangle(agent.Cell.X * tileSize, agent.Cell.Y * tileSize, tileSize, tileSize);
                 var size = Math.Max(6, (int)(tileSize * 0.72f));
                 var agentRect = new Rectangle(rect.Center.X - size / 2, rect.Center.Y - size / 2, size, size);
-                DrawGlow(new Vector2(rect.Center.X, rect.Center.Y), 12, factionColor * 0.4f);
+                if (renderProfile.EntityGlow)
+                    DrawGlow(new Vector2(rect.Center.X, rect.Center.Y), 12, factionColor * 0.4f);
                 DrawRect(agentRect, agent.Energy < 25 ? UITheme.CriticalText : factionColor);
-                DrawRect(agentRect, new Color(18, 22, 28), 1);
                 var markerSize = Math.Max(2, size / 4);
                 var markerX = rect.Center.X + Math.Clamp(agent.Facing.X, -1, 1) * Math.Max(1, size / 4) - markerSize / 2;
                 var markerY = rect.Center.Y + Math.Clamp(agent.Facing.Y, -1, 1) * Math.Max(1, size / 4) - markerSize / 2;
-                DrawRect(new Rectangle(markerX, markerY, markerSize, markerSize), new Color(226, 211, 154));
+                if (renderProfile.DetailedAgents)
+                {
+                    DrawRect(agentRect, new Color(18, 22, 28), 1);
+                    DrawRect(new Rectangle(markerX, markerY, markerSize, markerSize), new Color(226, 211, 154));
+                }
                 if (agent.CarriedFood > 0)
                     DrawRect(new Rectangle(agentRect.Right, agentRect.Bottom - 2, 2, 2), new Color(255, 210, 106));
 
@@ -674,12 +689,40 @@ public sealed partial class Game1 : Game
         // Only track windowed size when not in fullscreen
         if (!_windowModeTransition && !_graphics.IsFullScreen && Window.ClientBounds.Width > 0 && Window.ClientBounds.Height > 0)
         {
-            _windowedWidth = Math.Max(640, Window.ClientBounds.Width);
-            _windowedHeight = Math.Max(360, Window.ClientBounds.Height);
+            var clampedBounds = GameLayout.ClampWindowBounds(Window.ClientBounds);
+            _windowedWidth = clampedBounds.Width;
+            _windowedHeight = clampedBounds.Height;
+            if (clampedBounds.Width != Window.ClientBounds.Width || clampedBounds.Height != Window.ClientBounds.Height)
+            {
+                _windowMinimumClampPending = true;
+                return;
+            }
         }
 
         // Update layout and camera when window size changes
         if (!_windowModeTransition && Window.ClientBounds.Width > 0 && Window.ClientBounds.Height > 0)
+            UpdateLayoutAndCamera();
+    }
+
+    private void ApplyPendingWindowMinimum()
+    {
+        if (!_windowMinimumClampPending || _graphics.IsFullScreen)
+            return;
+
+        _windowMinimumClampPending = false;
+        _windowModeTransition = true;
+        try
+        {
+            _graphics.PreferredBackBufferWidth = _windowedWidth;
+            _graphics.PreferredBackBufferHeight = _windowedHeight;
+            _graphics.ApplyChanges();
+        }
+        finally
+        {
+            _windowModeTransition = false;
+        }
+
+        if (Window.ClientBounds.Width > 0 && Window.ClientBounds.Height > 0)
             UpdateLayoutAndCamera();
     }
 
@@ -995,10 +1038,55 @@ public sealed partial class Game1 : Game
     // UI Readability & Performance Foundation - UI Cache
     private sealed class UICache
     {
+        private static readonly string[] ScoreNames = { "Население", "Пища", "Устойчивость", "Поселения", "Вмешательства" };
+        private EmergentSimulationWorld? _analyticsWorld;
+        private long _analyticsTick = -1;
+        private int _reservedResonance = -1;
+
         public int StoredFood { get; private set; }
+        public string[] ScoreRows { get; } = new string[5];
+        public float[] ScoreValues { get; } = new float[5];
+        public List<string> AnalyticsLines { get; } = new();
+        public long AnalyticsRevision { get; private set; }
+
         public void MaybeUpdate(EmergentSimulationWorld world, int selectedAgentId, float uiScale)
         {
             StoredFood = world.StoredFoodUnits;
+            var reservedResonance = Math.Max(0, world.Resonance - world.AvailableResonance);
+            if (ReferenceEquals(_analyticsWorld, world) && _analyticsTick == world.Tick && _reservedResonance == reservedResonance)
+                return;
+
+            _analyticsWorld = world;
+            _analyticsTick = world.Tick;
+            _reservedResonance = reservedResonance;
+
+            ScoreValues[0] = world.ScorePopulationComponent;
+            ScoreValues[1] = world.ScoreFoodComponent;
+            ScoreValues[2] = world.ScoreCrisisComponent;
+            ScoreValues[3] = world.ScoreSettlementComponent;
+            ScoreValues[4] = world.ScoreEfficiencyComponent;
+            for (var i = 0; i < ScoreRows.Length; i++)
+                ScoreRows[i] = $"{ScoreNames[i]}   {ScoreValues[i]:0}/100";
+
+            AnalyticsLines.Clear();
+            AnalyticsLines.Add(reservedResonance > 0
+                ? $"Очередь: зарезервировано {reservedResonance} R; команды ждут тика."
+                : "Очередь вмешательств пуста.");
+            AnalyticsLines.Add($"Команд обработано: {world.InterventionLog.Count} · приняты симуляцией: {world.SuccessfulInterventions} · отклонены: {world.FailedInterventions}");
+            AnalyticsLines.Add($"Израсходовано: {world.TotalResonanceSpent} R. Применение команды ещё не доказывает пользу.");
+            AnalyticsLines.Add($"Цветение: жители собрали {world.BloomFoodHarvested:N0} еды из созданных/усиленных источников.");
+            AnalyticsLines.Add($"Маяк: маршрутов начато {world.BeaconExplorationStarts:N0} → достигли цели {world.BeaconArrivals:N0}.");
+            AnalyticsLines.Add($"Озарение: обучено {world.InsightAgentsTaught:N0} → маршрутов начато {world.InsightFoodRoutesStarted:N0} → прибыли {world.InsightFoodArrivals:N0} → собрали {world.InsightFoodHarvested:N0} еды.");
+            AnalyticsLines.Add($"Проходы игрока: жителей пересекло открытые проходы {world.PlayerPassageTraversals:N0} раз.");
+            AnalyticsLines.Add(world.EcologyStatus);
+            AnalyticsLines.Add($"Проверок риска: {world.Ecology.DroughtChecks} · жители в зоне: {world.Ecology.LastDroughtLocalPopulation}");
+            AnalyticsLines.Add($"Съедено еды: {world.FoodConsumed:N0} · потрачено на рождения: {world.Ecology.FoodSpentOnBirths:N0}");
+            AnalyticsLines.Add($"Испорчено: {world.Ecology.FoodSpoiled:N0} · потеряно при засухе: {world.Ecology.DroughtFoodLost:N0}");
+            AnalyticsLines.Add($"Рождение: попыток {world.Ecology.BirthAttempts:N0} · блокировки — родители {world.Ecology.BirthBlockedParents:N0}, еда {world.Ecology.BirthBlockedFood:N0}, место {world.Ecology.BirthBlockedSpace:N0}");
+            AnalyticsLines.Add($"Популяция: рождения {world.Births:N0} · смерти {world.Deaths:N0} (голод: {world.StarvationDeaths:N0})");
+            AnalyticsLines.Add($"Общение: крики {world.ShoutsMade:N0} · услышано {world.ShoutsHeard:N0} · проверок {world.ShoutLearningEvents:N0} · успешных уроков {world.SuccessfulShoutLessons:N0}");
+            AnalyticsLines.Add("F10 — открыть JSONL-логи для анализа.");
+            AnalyticsRevision++;
         }
     }
 

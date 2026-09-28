@@ -149,6 +149,8 @@ public sealed partial class EmergentSimulationWorld
         public int OriginalAmount { get; set; }
         public int RemainingBoost { get; set; }
         public bool CreatedSource { get; set; }
+        public int HarvestedUnits { get; set; }
+        public bool ImpactAnnounced { get; set; }
     }
 
     /// <summary>Active Beacon effect - attraction signal at a cell.</summary>
@@ -157,6 +159,8 @@ public sealed partial class EmergentSimulationWorld
         public Point Cell { get; set; }
         public int RemainingTicks { get; set; }
         public float Strength { get; set; }
+        public int ExplorationTrips { get; set; }
+        public bool ImpactAnnounced { get; set; }
     }
 
     // Settlement system
@@ -188,6 +192,17 @@ public sealed partial class EmergentSimulationWorld
     private int _totalResonanceSpent = 0;
     private int _successfulInterventions = 0;
     private int _failedInterventions = 0;
+    private long _bloomFoodHarvested;
+    private long _beaconExplorationStarts;
+    private long _beaconArrivals;
+    private long _insightAgentsTaught;
+    private long _insightFoodRoutesStarted;
+    private long _insightFoodArrivals;
+    private long _insightFoodHarvested;
+    private long _passageTraversals;
+    private long _playerPassageTraversals;
+    private readonly HashSet<Point> _playerPassageCells = new();
+    private readonly HashSet<Point> _announcedPassageImpactCells = new();
     private int _foodCrisisCount;
     private int _foodCrisisRecoveredCount;
     private int _shoutsMade;
@@ -196,6 +211,7 @@ public sealed partial class EmergentSimulationWorld
     private int _shoutLearningEvents;
     private int _successfulShoutLessons;
     private int _failedShoutLessons;
+    private readonly StepPerformanceProfiler _stepPerformanceProfiler = new();
 
     public IReadOnlyList<AgentState> Agents => _agents;
     public IReadOnlyList<FactionState> Factions => _factions;
@@ -233,6 +249,7 @@ public sealed partial class EmergentSimulationWorld
     public long DistanceGridRequests => _pathFinder.DistanceGridRequests;
     public int LastStepsProcessed { get; private set; }
     public double LastSimulationMilliseconds { get; private set; }
+    public StepPerformanceSummary StepPerformance => _stepPerformanceProfiler.GetSummary();
     public double LastEffectiveSimulationSpeed { get; private set; }
     public long CatchingUpFrames { get; private set; }
     public double CatchingUpSeconds { get; private set; }
@@ -374,6 +391,15 @@ public sealed partial class EmergentSimulationWorld
 
     /// <summary>Number of failed interventions.</summary>
     public int FailedInterventions => _failedInterventions;
+    public long BloomFoodHarvested => _bloomFoodHarvested;
+    public long BeaconExplorationStarts => _beaconExplorationStarts;
+    public long BeaconArrivals => _beaconArrivals;
+    public long InsightAgentsTaught => _insightAgentsTaught;
+    public long InsightFoodRoutesStarted => _insightFoodRoutesStarted;
+    public long InsightFoodArrivals => _insightFoodArrivals;
+    public long InsightFoodHarvested => _insightFoodHarvested;
+    public long PassageTraversals => _passageTraversals;
+    public long PlayerPassageTraversals => _playerPassageTraversals;
     public int ShoutsMade => _shoutsMade;
     public int ShoutsHeard => _shoutsHeard;
     public int FoodShouts => _shoutTypeCounts[(int)ShoutType.Food];
@@ -414,7 +440,7 @@ public sealed partial class EmergentSimulationWorld
     }
     public IReadOnlyList<ShoutSignal> RecentShouts => _recentShouts;
 
-    /// <summary>Current Resilient Settlement score (breakdown components).</summary>
+    /// <summary>Provisional, non-competitive Resilient Settlement score; not leaderboard-ready.</summary>
     public float ScorePopulationComponent => _scorePopulationComponent;
     public float ScoreFoodComponent => _scoreFoodComponent;
     public float ScoreCrisisComponent => _scoreCrisisComponent;
@@ -811,6 +837,8 @@ public sealed partial class EmergentSimulationWorld
                 OriginalAmount = b.OriginalAmount,
                 RemainingBoost = b.RemainingBoost,
                 CreatedSource = b.CreatedSource,
+                HarvestedUnits = b.HarvestedUnits,
+                ImpactAnnounced = b.ImpactAnnounced,
             }).ToList(),
             ActiveBeacons = _activeBeacons.Values
                 .OrderBy(b => b.Cell.Y * Width + b.Cell.X)
@@ -818,7 +846,9 @@ public sealed partial class EmergentSimulationWorld
             {
                 Cell = PointSnapshot.From(b.Cell),
                 RemainingTicks = b.RemainingTicks,
-                Strength = b.Strength
+                Strength = b.Strength,
+                ExplorationTrips = b.ExplorationTrips,
+                ImpactAnnounced = b.ImpactAnnounced,
             }).ToList(),
             ScoreLastTick = _scoreLastTick,
             ScorePopulationComponent = _scorePopulationComponent,
@@ -837,6 +867,19 @@ public sealed partial class EmergentSimulationWorld
             ShoutLearningEvents = _shoutLearningEvents,
             SuccessfulShoutLessons = _successfulShoutLessons,
             FailedShoutLessons = _failedShoutLessons,
+            BloomFoodHarvested = _bloomFoodHarvested,
+            BeaconExplorationStarts = _beaconExplorationStarts,
+            BeaconArrivals = _beaconArrivals,
+            InsightAgentsTaught = _insightAgentsTaught,
+            InsightFoodRoutesStarted = _insightFoodRoutesStarted,
+            InsightFoodArrivals = _insightFoodArrivals,
+            InsightFoodHarvested = _insightFoodHarvested,
+            PassageTraversals = _passageTraversals,
+            PlayerPassageTraversals = _playerPassageTraversals,
+            PlayerPassageCells = _playerPassageCells.OrderBy(p => p.Y).ThenBy(p => p.X)
+                .Select(PointSnapshot.From).ToList(),
+            AnnouncedPassageImpactCells = _announcedPassageImpactCells.OrderBy(p => p.Y).ThenBy(p => p.X)
+                .Select(PointSnapshot.From).ToList(),
         };
     }
 
@@ -880,6 +923,16 @@ public sealed partial class EmergentSimulationWorld
         foreach (var agent in snapshot.Agents)
         {
             var loadedAgent = agent.ToAgent();
+            if (snapshot.Version < WorldSnapshot.InterventionOutcomeAttributionVersion)
+            {
+                // v10-v23 had no per-agent causal route markers. Do not infer
+                // attribution from an old generic path or remembered clue.
+                loadedAgent.HasInsightRouteAttribution = false;
+                loadedAgent.InsightRouteArrived = false;
+                loadedAgent.InsightRouteCell = Point.Zero;
+                loadedAgent.HasBeaconTarget = false;
+                loadedAgent.BeaconTargetCell = Point.Zero;
+            }
             loadedAgent.PreviousCell = loadedAgent.Cell;
             world._agents.Add(loadedAgent);
         }
@@ -1120,18 +1173,59 @@ public sealed partial class EmergentSimulationWorld
             world._resonanceRegenTick = snapshot.ResonanceRegenTick > 0 ? snapshot.ResonanceRegenTick : 5000;
             world._totalResonanceSpent = Math.Max(0, snapshot.TotalResonanceSpent);
             world._successfulInterventions = Math.Max(0, snapshot.SuccessfulInterventions);
-            world._failedInterventions = Math.Max(0, snapshot.FailedInterventions);
+                world._failedInterventions = Math.Max(0, snapshot.FailedInterventions);
+                if (snapshot.Version >= 21)
+                {
+                    world._bloomFoodHarvested = Math.Max(0, snapshot.BloomFoodHarvested);
+                    world._beaconExplorationStarts = Math.Max(0, snapshot.BeaconExplorationStarts);
+                    world._insightAgentsTaught = Math.Max(0, snapshot.InsightAgentsTaught);
+                    if (snapshot.Version >= 23)
+                        world._insightFoodRoutesStarted = Math.Max(0, snapshot.InsightFoodRoutesStarted);
+                    world._passageTraversals = Math.Max(0, snapshot.PassageTraversals);
+                    world._playerPassageTraversals = Math.Max(0, snapshot.PlayerPassageTraversals);
+                    if (snapshot.Version >= WorldSnapshot.InterventionOutcomeAttributionVersion)
+                    {
+                        world._beaconArrivals = Math.Max(0, snapshot.BeaconArrivals);
+                        world._insightFoodArrivals = Math.Max(0, snapshot.InsightFoodArrivals);
+                        world._insightFoodHarvested = Math.Max(0, snapshot.InsightFoodHarvested);
+                    }
+                    world._playerPassageCells.Clear();
+                    foreach (var cell in snapshot.PlayerPassageCells ?? new List<PointSnapshot>())
+                    {
+                        var point = cell.ToPoint();
+                        if (world._map.InBounds(point) && world._map[point] == CellType.Door)
+                            world._playerPassageCells.Add(point);
+                    }
+                    world._announcedPassageImpactCells.Clear();
+                    foreach (var cell in snapshot.AnnouncedPassageImpactCells ?? new List<PointSnapshot>())
+                    {
+                        var point = cell.ToPoint();
+                        if (world._playerPassageCells.Contains(point))
+                            world._announcedPassageImpactCells.Add(point);
+                    }
+                }
 
             world._pendingInterventions.Clear();
             if (snapshot.PendingInterventions != null)
             {
                 foreach (var cmd in snapshot.PendingInterventions)
                 {
+                    var type = (InterventionType)cmd.Type;
+                    var cell = cmd.Cell?.ToPoint() ?? new Point(-1, -1);
+                    var expectedCost = world.GetInterventionCost(type);
+                    // Saves are user-editable JSON. Do not restore malformed
+                    // commands that can mint Resonance, bypass bounds checks,
+                    // or remain queued forever.
+                    if (type is InterventionType.None || !Enum.IsDefined(type) || expectedCost <= 0 ||
+                        cmd.Cost != expectedCost || !world._map.InBounds(cell) || world.Tick == long.MaxValue ||
+                        cmd.RequestedTick != world.Tick + 1)
+                        continue;
+
                     world._pendingInterventions.Enqueue(new InterventionCommand
                     {
-                        Type = (InterventionType)cmd.Type,
-                        Cell = cmd.Cell.ToPoint(),
-                        Cost = cmd.Cost,
+                        Type = type,
+                        Cell = cell,
+                        Cost = expectedCost,
                         RequestedTick = cmd.RequestedTick
                     });
                 }
@@ -1178,6 +1272,8 @@ public sealed partial class EmergentSimulationWorld
                                 0,
                                 Math.Max(0, bloom.BoostAmount)),
                         CreatedSource = snapshot.Version >= WorldSnapshot.FirstCycleScoreCountersVersion && bloom.CreatedSource,
+                        HarvestedUnits = snapshot.Version >= 21 ? Math.Max(0, bloom.HarvestedUnits) : 0,
+                        ImpactAnnounced = snapshot.Version >= 22 && bloom.ImpactAnnounced,
                     };
                 }
             }
@@ -1191,7 +1287,9 @@ public sealed partial class EmergentSimulationWorld
                     {
                         Cell = beacon.Cell.ToPoint(),
                         RemainingTicks = beacon.RemainingTicks,
-                        Strength = beacon.Strength
+                        Strength = beacon.Strength,
+                        ExplorationTrips = snapshot.Version >= 21 ? Math.Max(0, beacon.ExplorationTrips) : 0,
+                        ImpactAnnounced = snapshot.Version >= 22 && beacon.ImpactAnnounced,
                     };
                 }
             }
@@ -1389,6 +1487,8 @@ public sealed partial class EmergentSimulationWorld
     private void Step(float dt)
     {
         Tick++;
+        var profileThisTick = StepPerformanceProfiler.ShouldSample(Tick);
+        var stepStarted = profileThisTick ? Stopwatch.GetTimestamp() : 0;
         UpdateColonyEcology();
 
         // ========== First Cycle: Process pending interventions at tick boundary ==========
@@ -1423,6 +1523,7 @@ public sealed partial class EmergentSimulationWorld
             UpdateDormantAgents();
         }
 
+        var agentLoopStarted = profileThisTick ? Stopwatch.GetTimestamp() : 0;
         foreach (var agent in _agents)
         {
             if (!agent.Alive)
@@ -1565,6 +1666,7 @@ public sealed partial class EmergentSimulationWorld
 
             // Rest conserves energy; only consumed food replenishes it.
         }
+        var agentLoopElapsed = profileThisTick ? Stopwatch.GetTimestamp() - agentLoopStarted : 0;
 
         _birthCooldown = MathF.Max(0, _birthCooldown - dt);
         _eventCooldown = Math.Max(0, _eventCooldown - 1);
@@ -1621,6 +1723,7 @@ public sealed partial class EmergentSimulationWorld
         if (_buildingCandidatesOffset == 0)
             RegrowFood();
 
+        var distanceGridPreparationStarted = profileThisTick ? Stopwatch.GetTimestamp() : 0;
         // Batched multi-source pathfinding distance grids
         // Exploration grid: every 50 ticks (phase shifted from regrow)
         _explorationGridOffset = (_explorationGridOffset + 1) % 50;
@@ -1649,6 +1752,11 @@ public sealed partial class EmergentSimulationWorld
             if (migrationTargets.Count > 0)
                 _migrationDistanceGrid = _pathFinder.ComputeDistanceToNearestTarget(migrationTargets);
         }
+        // This phase measures periodic multi-source distance-grid preparation,
+        // not all pathfinding. Per-agent path searches are included in AgentLoop.
+        var distanceGridPreparationElapsed = profileThisTick
+            ? Stopwatch.GetTimestamp() - distanceGridPreparationStarted
+            : 0;
 
         // Deferred dead agent cleanup - remove from agents list after iteration
         if (_deadAgents.Count > 0)
@@ -1664,8 +1772,9 @@ public sealed partial class EmergentSimulationWorld
 
         _agentIndex.UpdateIncremental(_agents, Tick);
         TryBirth();
-        _resourceIndex.Rebuild(_food);
         RefreshStats();
+        if (profileThisTick)
+            _stepPerformanceProfiler.Record(Stopwatch.GetTimestamp() - stepStarted, agentLoopElapsed, distanceGridPreparationElapsed);
     }
 
     private void RefreshStats()
@@ -2529,6 +2638,9 @@ public sealed partial class EmergentSimulationWorld
             case AgentAction.Exploring:
                 if (agent.Cell == agent.TargetCell)
                 {
+                    if (agent.HasBeaconTarget && agent.BeaconTargetCell == agent.Cell)
+                        _beaconArrivals++;
+                    agent.HasBeaconTarget = false;
                     agent.ExplorationTrips++;
                     LearnShoutOutcome(agent, ShoutType.Rally, successful: true, outcomeCell: agent.Cell);
                     ApplyLearning(agent, AgentAction.Exploring, 0.25f);
@@ -2537,6 +2649,7 @@ public sealed partial class EmergentSimulationWorld
                 }
                 else if (agent.Path.Count == 0 || agent.PathIndex >= agent.Path.Count)
                 {
+                    agent.HasBeaconTarget = false;
                     LearnShoutOutcome(agent, ShoutType.Rally, successful: false, outcomeCell: agent.Cell);
                     agent.Action = AgentAction.Idle;
                 }
@@ -2564,6 +2677,12 @@ public sealed partial class EmergentSimulationWorld
                     var targetFood = FindFoodAt(agent.TargetCell);
                     if (targetFood is not null && targetFood.Amount > 0)
                     {
+                        if (agent.HasInsightRouteAttribution && !agent.InsightRouteArrived &&
+                            agent.InsightRouteCell == targetFood.Cell && agent.FoodTargetCell == targetFood.Cell)
+                        {
+                            _insightFoodArrivals++;
+                            agent.InsightRouteArrived = true;
+                        }
                         agent.Action = AgentAction.GatheringFood;
                         agent.Path.Clear();
                         agent.PathIndex = 0;
@@ -2592,6 +2711,7 @@ public sealed partial class EmergentSimulationWorld
                 var returnEnergy = 45f + (1f - agent.RiskTolerance) * 20f;
                 if (agent.CarriedFood >= 3 || agent.Energy < returnEnergy)
                 {
+                    ClearInsightRouteAttribution(agent);
                     ReleaseFoodReservation(agent);
                     agent.Action = AgentAction.ReturningToWall;
                     SetPathToNearestWall(agent);
@@ -2663,6 +2783,18 @@ public sealed partial class EmergentSimulationWorld
         var oldCell = agent.Cell;
         var delta = new Point(nextCell.X - agent.Cell.X, nextCell.Y - agent.Cell.Y);
         agent.Cell = nextCell;
+        if (_map[nextCell] == CellType.Door)
+        {
+            _passageTraversals++;
+            if (_playerPassageCells.Contains(nextCell))
+            {
+                _playerPassageTraversals++;
+                if (_announcedPassageImpactCells.Add(nextCell))
+                    RecordEvent(WorldEventType.PlayerIntervention,
+                        $"Проход работает: житель #{agent.Id} впервые прошёл через открытый вами блок ({nextCell.X},{nextCell.Y}).",
+                        WorldEventImportance.Major, agent.FactionId, nextCell);
+            }
+        }
         if (delta.X != 0 || delta.Y != 0)
             agent.Facing = new Point(Math.Sign(delta.X), Math.Sign(delta.Y));
         agent.PathIndex++;
@@ -2683,6 +2815,10 @@ public sealed partial class EmergentSimulationWorld
             var node = FindFoodAt(agent.Cell);
             if (node is not null && node.Amount > 0)
             {
+                if (agent.HasInsightRouteAttribution && agent.InsightRouteArrived &&
+                    agent.InsightRouteCell == node.Cell && agent.Cell == node.Cell)
+                    _insightFoodHarvested++;
+
                 var firstUnit = agent.CarriedFood == 0;
                 node.Amount--;
                 ConsumeBloomFood(node);
@@ -2726,6 +2862,7 @@ public sealed partial class EmergentSimulationWorld
                             $"Источник еды исчерпан ({node.Cell.X},{node.Cell.Y})",
                             WorldEventImportance.Minor, agent.FactionId, node.Cell);
                     }
+                    ClearInsightRouteAttribution(agent);
                     ReleaseFoodReservation(agent);
                 }
             }
@@ -2733,6 +2870,7 @@ public sealed partial class EmergentSimulationWorld
 
         if (agent.Action == AgentAction.StoringFood && agent.CarriedFood > 0)
         {
+            ClearInsightRouteAttribution(agent);
             var stored = agent.CarriedFood;
             FoodStockpile += stored;
             _foodStorage[agent.Cell] = _foodStorage.GetValueOrDefault(agent.Cell) + stored;
@@ -3262,31 +3400,47 @@ public sealed partial class EmergentSimulationWorld
 
         var roleBonus = agent.Role is AgentRole.Scout or AgentRole.Pathfinder ? 0.18f : 0f;
         var chance = 0.04f + agent.ExplorationDrive * 0.18f + agent.Intelligence * 0.06f + roleBonus;
-        if (_rng.NextDouble() > chance)
-            return false;
-
-        // First Cycle: choose the closest reachable beacon with a stable
-        // coordinate tie-break. Dictionary insertion order is not gameplay.
-        Point? beaconTarget = _activeBeacons.Values
+        // First Cycle: prefer the closest beacon with a viable path. If that
+        // point is blocked or too close to be a useful trip, try the next one.
+        // Stable coordinate ties keep dictionary insertion order out of RNG.
+        var beaconCandidates = _activeBeacons.Values
             .Where(beacon => Math.Abs(beacon.Cell.X - agent.Cell.X) + Math.Abs(beacon.Cell.Y - agent.Cell.Y) <= 30)
             .OrderBy(beacon => Math.Abs(beacon.Cell.X - agent.Cell.X) + Math.Abs(beacon.Cell.Y - agent.Cell.Y))
             .ThenBy(beacon => beacon.Cell.Y)
             .ThenBy(beacon => beacon.Cell.X)
-            .Select(beacon => (Point?)beacon.Cell)
-            .FirstOrDefault();
+            .ToArray();
+        var beacon = beaconCandidates.FirstOrDefault();
 
-        if (beaconTarget.HasValue)
+        var beaconDistance = beacon is null
+            ? int.MaxValue
+            : Math.Abs(beacon.Cell.X - agent.Cell.X) + Math.Abs(beacon.Cell.Y - agent.Cell.Y);
+        var beaconBoost = beacon is null ? 0f : 0.55f * beacon.Strength * (1f - beaconDistance / 31f);
+        if (_rng.NextDouble() > Math.Min(0.95f, chance + beaconBoost))
+            return false;
+
+        foreach (var candidateBeacon in beaconCandidates)
         {
-            var path = _pathFinder.FindPath(agent.Cell, beaconTarget.Value);
-            if (path.Count >= 4)
+            var path = _pathFinder.FindPath(agent.Cell, candidateBeacon.Cell);
+            if (path.Count < 4)
+                continue;
+
+            agent.Path = path;
+            agent.PathIndex = 0;
+            agent.TargetCell = candidateBeacon.Cell;
+            agent.HasBeaconTarget = true;
+            agent.BeaconTargetCell = candidateBeacon.Cell;
+            agent.ExplorationCooldown = MathF.Max(4f, 12f - agent.Intelligence * 5f);
+            agent.Action = AgentAction.Exploring;
+            candidateBeacon.ExplorationTrips++;
+            _beaconExplorationStarts++;
+            if (!candidateBeacon.ImpactAnnounced)
             {
-                agent.Path = path;
-                agent.PathIndex = 0;
-                agent.TargetCell = beaconTarget.Value;
-                agent.ExplorationCooldown = MathF.Max(4f, 12f - agent.Intelligence * 5f);
-                agent.Action = AgentAction.Exploring;
-                return true;
+                candidateBeacon.ImpactAnnounced = true;
+                RecordEvent(WorldEventType.PlayerIntervention,
+                    $"Маяк сработал: исследователь #{agent.Id} начал путь к сигналу ({candidateBeacon.Cell.X},{candidateBeacon.Cell.Y}).",
+                    WorldEventImportance.Major, agent.FactionId, candidateBeacon.Cell);
             }
+            return true;
         }
 
         // Use precomputed exploration distance grid to pick target
@@ -3681,7 +3835,7 @@ public sealed partial class EmergentSimulationWorld
                     if (_rng.NextDouble() < 0.32 && node.Amount > 1)
                     {
                         node.Amount--;
-                        ConsumeBloomFood(node);
+                        ConsumeBloomFood(node, harvestedByAgents: false);
                     }
                 }
 
@@ -3762,6 +3916,7 @@ public sealed partial class EmergentSimulationWorld
         var node = new ResourceNode { Cell = cell, Amount = amount };
         _food.Add(node);
         _foodByCell[cell] = node;
+        _resourceIndex.Add(node);
         _chunks.RegisterFood(cell);
     }
 
@@ -3779,6 +3934,7 @@ public sealed partial class EmergentSimulationWorld
 
     private bool SetFoodTarget(AgentState agent, Point target)
         {
+            ClearInsightRouteAttribution(agent);
             var node = FindFoodAt(target);
             if (node is null || node.Amount <= 0 || !node.CanReserve(agent.Id))
                 return false;
@@ -3794,7 +3950,17 @@ public sealed partial class EmergentSimulationWorld
             agent.TargetCell = target;  // Also update TargetCell for UpdateAgentState check
 
             if (agent.Path.Count > 0)
+            {
+                if (agent.HasInsightFoodClue && agent.InsightFoodCell == target)
+                {
+                    _insightFoodRoutesStarted++;
+                    agent.InsightRouteCell = target;
+                    agent.HasInsightRouteAttribution = true;
+                    agent.InsightRouteArrived = false;
+                    agent.HasInsightFoodClue = false;
+                }
                 return true;
+            }
 
             ReleaseFoodReservation(agent);
             return false;
@@ -3805,7 +3971,7 @@ public sealed partial class EmergentSimulationWorld
         if (!agent.HasFoodTarget)
             return;
 
-        foreach (var node in _food)
+        if (_foodByCell.TryGetValue(agent.FoodTargetCell, out var node))
             node.ReservedBy.Remove(agent.Id);
         agent.HasFoodTarget = false;
     }
@@ -3855,6 +4021,7 @@ public sealed partial class EmergentSimulationWorld
 
     private void MarkFoodFailure(AgentState agent)
     {
+        ClearInsightRouteAttribution(agent);
         agent.FailedFoodTrips++;
         LearnShoutOutcome(agent, ShoutType.Food, successful: false, outcomeCell: agent.FoodTargetCell);
         LearnShoutOutcome(agent, ShoutType.Danger, successful: true, outcomeCell: agent.FoodTargetCell);
@@ -3868,10 +4035,31 @@ public sealed partial class EmergentSimulationWorld
             agent.HasKnownFood = false;
     }
 
-    private void ConsumeBloomFood(ResourceNode node)
+    private static void ClearInsightRouteAttribution(AgentState agent)
+    {
+        agent.HasInsightRouteAttribution = false;
+        agent.InsightRouteArrived = false;
+        agent.InsightRouteCell = Point.Zero;
+    }
+
+    private void ConsumeBloomFood(ResourceNode node, bool harvestedByAgents = true)
     {
         if (_activeBlooms.TryGetValue(node.Cell, out var bloom) && bloom.RemainingBoost > 0)
+        {
             bloom.RemainingBoost--;
+            if (harvestedByAgents)
+            {
+                bloom.HarvestedUnits++;
+                _bloomFoodHarvested++;
+                if (!bloom.ImpactAnnounced)
+                {
+                    bloom.ImpactAnnounced = true;
+                    RecordEvent(WorldEventType.PlayerIntervention,
+                        $"Цветение дало пищу: житель собрал первый ресурс у ({node.Cell.X},{node.Cell.Y}).",
+                        WorldEventImportance.Major, -1, node.Cell);
+                }
+            }
+        }
     }
 
     private ResourceNode? FindFoodAt(Point cell)
@@ -4266,11 +4454,10 @@ public sealed partial class EmergentSimulationWorld
                 _totalResonanceSpent += command.Cost;
                 _successfulInterventions++;
             }
-            else
-            {
-                _failedInterventions++;
-            }
         }
+
+        if (!success)
+            _failedInterventions++;
 
         // Log the intervention
         _interventionLog.Add(new InterventionLogEntry
@@ -4292,13 +4479,40 @@ public sealed partial class EmergentSimulationWorld
 
     private bool ApplyPassage(Point cell, out string reason)
     {
+        Span<Point> neighbours = stackalloc Point[4];
+        var neighbourCount = 0;
+        var offsets = new[] { new Point(0, -1), new Point(1, 0), new Point(0, 1), new Point(-1, 0) };
+        foreach (var offset in offsets)
+        {
+            var neighbour = new Point(cell.X + offset.X, cell.Y + offset.Y);
+            if (_map.IsWalkable(neighbour))
+                neighbours[neighbourCount++] = neighbour;
+        }
+
+        var connectsPreviouslySeparateAreas = false;
+        for (var i = 0; i < neighbourCount && !connectsPreviouslySeparateAreas; i++)
+        {
+            for (var j = i + 1; j < neighbourCount; j++)
+            {
+                if (_pathFinder.FindPath(neighbours[i], neighbours[j]).Count == 0)
+                {
+                    connectsPreviouslySeparateAreas = true;
+                    break;
+                }
+            }
+        }
+
         if (!_map.RemoveWallCell(cell)) { reason = "Wall no longer exists"; return false; }
         _map[cell] = CellType.Door; // Walkable and excluded from future wall construction.
+        if (connectsPreviouslySeparateAreas)
+            _playerPassageCells.Add(cell);
         _chunks.UnregisterWall(cell);
         _wallIndex.Rebuild(_map.WallCells);
         _pathFinder.InvalidatePathCache();
         WallBlocksRemoved++;
-        reason = "Passage opened";
+        reason = connectsPreviouslySeparateAreas
+            ? "Passage opened between previously disconnected areas"
+            : "Passage opened; surrounding areas were already connected";
         return true;
     }
 
@@ -4322,8 +4536,8 @@ public sealed partial class EmergentSimulationWorld
             foodNode = new ResourceNode { Cell = cell, Amount = boostAmount };
             _food.Add(foodNode);
             _foodByCell[cell] = foodNode;
+            _resourceIndex.Add(foodNode);
             _chunks.RegisterFood(cell);
-            _resourceIndex.Rebuild(_food);
             createdSource = true;
         }
         else
@@ -4338,7 +4552,6 @@ public sealed partial class EmergentSimulationWorld
             foodNode.Amount += boostAmount;
             if (wasDepleted)
                 _chunks.RegisterFood(foodNode.Cell);
-            _resourceIndex.Update(foodNode);
         }
 
         _activeBlooms[foodNode.Cell] = new BloomEffect
@@ -4349,6 +4562,7 @@ public sealed partial class EmergentSimulationWorld
             OriginalAmount = createdSource ? 0 : foodNode.Amount - boostAmount,
             RemainingBoost = boostAmount,
             CreatedSource = createdSource,
+            ImpactAnnounced = false,
         };
 
         reason = createdSource
@@ -4375,7 +4589,6 @@ public sealed partial class EmergentSimulationWorld
                     node.Amount = Math.Max(0, node.Amount - kvp.Value.RemainingBoost);
                     if (previousAmount > 0 && node.Amount == 0)
                         _chunks.UnregisterFood(node.Cell);
-                    _resourceIndex.Update(node);
                 }
                 expiredBlooms.Add(kvp.Key);
             }
@@ -4413,7 +4626,8 @@ public sealed partial class EmergentSimulationWorld
         {
             Cell = cell,
             RemainingTicks = 200, // ~20 seconds at normal speed
-            Strength = 1.0f
+            Strength = 1.0f,
+            ImpactAnnounced = false,
         };
 
         reason = $"Beacon placed at {cell} for 200 ticks";
@@ -4422,32 +4636,80 @@ public sealed partial class EmergentSimulationWorld
 
     private bool ApplyInsightPulse(Point cell, out string reason)
     {
-        // Find nearby agents and boost their knowledge
+        // Insight transfers a usable clue only when a nearby, eligible agent
+        // has a walkable route to a live source. Two multi-source distance
+        // grids bound this validation to O(map cells), rather than one path
+        // search per agent/source pair.
         const int radius = 5;
-        int affected = 0;
+        const int sourceRadius = 12;
+        var recipients = _agents
+            .Where(agent => agent.Alive && agent.Energy >= 20f &&
+                Math.Abs(agent.Cell.X - cell.X) + Math.Abs(agent.Cell.Y - cell.Y) <= radius &&
+                _map.IsWalkable(agent.Cell))
+            .OrderBy(agent => Math.Abs(agent.Cell.X - cell.X) + Math.Abs(agent.Cell.Y - cell.Y))
+            .ThenBy(agent => agent.Id)
+            .ToList();
 
-        foreach (var agent in _agents)
+        if (recipients.Count == 0)
         {
-            if (!agent.Alive) continue;
-
-            int dist = Math.Abs(agent.Cell.X - cell.X) + Math.Abs(agent.Cell.Y - cell.Y);
-            if (dist <= radius)
-            {
-                // Boost food knowledge and route knowledge
-                agent.FoodKnowledge = MathF.Min(1.0f, agent.FoodKnowledge + 0.3f);
-                agent.RouteKnowledge = MathF.Min(1.0f, agent.RouteKnowledge + 0.2f);
-                agent.LearningRate = MathF.Min(1.0f, agent.LearningRate + 0.1f);
-                affected++;
-            }
-        }
-
-        if (affected == 0)
-        {
-            reason = "No agents in range of Insight Pulse";
+            reason = "No eligible nearby agents can receive the pulse";
             return false;
         }
 
-        reason = $"Insight Pulse at {cell} affected {affected} agents (+0.3 FoodKnowledge, +0.2 RouteKnowledge, +0.1 LearningRate)";
+        var recipientCells = recipients
+            .Select(agent => agent.Cell)
+            .Distinct()
+            .OrderBy(point => point.Y)
+            .ThenBy(point => point.X)
+            .ToArray();
+        var distanceFromRecipients = _pathFinder.ComputeDistanceToNearestTarget(recipientCells);
+        var source = _food
+            .Where(node => node.Amount > 0 &&
+                Math.Abs(node.Cell.X - cell.X) + Math.Abs(node.Cell.Y - cell.Y) <= sourceRadius)
+            .OrderBy(node => Math.Abs(node.Cell.X - cell.X) + Math.Abs(node.Cell.Y - cell.Y))
+            .ThenByDescending(node => node.Amount)
+            .ThenBy(node => node.Cell.Y)
+            .ThenBy(node => node.Cell.X)
+            .FirstOrDefault(node => _map.InBounds(node.Cell) &&
+                distanceFromRecipients[node.Cell.Y * Width + node.Cell.X] >= 0);
+
+        if (source is null)
+        {
+            reason = "No live food source within 12 cells is reachable by nearby agents";
+            return false;
+        }
+
+        var distanceFromSource = _pathFinder.ComputeDistanceToNearestTarget(new[] { source.Cell });
+        var taught = 0;
+        foreach (var agent in recipients)
+        {
+            var alreadyKnowsUsefulSource = agent.HasKnownFood && agent.KnownFoodCell == source.Cell && agent.FoodKnowledge >= 0.85f;
+            if (alreadyKnowsUsefulSource)
+                continue;
+
+            var cellIndex = agent.Cell.Y * Width + agent.Cell.X;
+            if (distanceFromSource[cellIndex] < 0)
+                continue;
+            if (taught >= 24)
+                break;
+
+            agent.KnownFoodCell = source.Cell;
+            agent.HasKnownFood = true;
+            agent.InsightFoodCell = source.Cell;
+            agent.HasInsightFoodClue = true;
+            agent.FoodKnowledge = MathF.Max(agent.FoodKnowledge, 0.85f);
+            agent.RouteKnowledge = MathF.Max(agent.RouteKnowledge, 0.65f);
+            taught++;
+        }
+
+        if (taught == 0)
+        {
+            reason = "No reachable nearby agent can benefit from this source";
+            return false;
+        }
+
+        _insightAgentsTaught += taught;
+        reason = $"Revealed food at {source.Cell} to {taught} nearby agents; they can now choose that route";
         return true;
     }
 
@@ -4490,14 +4752,18 @@ public sealed partial class EmergentSimulationWorld
                     : 0;
                 _scoreSettlementComponent = MathF.Min(100f, stableSettlements * 15f + MathF.Min(50f, avgSettlementAge * 0.001f));
 
-        // Efficiency component: effect per Resonance spent
-        // An untouched experiment has no demonstrated intervention skill, so
-        // it earns no efficiency score. This is intentionally not a final
-        // leaderboard formula; it only reports reliable use of chosen tools.
-        float efficiency = _totalResonanceSpent > 0
-            ? (float)_successfulInterventions / _totalResonanceSpent
+        // Provisional First Cycle score, not leaderboard-ready. Count only
+        // observed outcomes: launches/route starts do not score; passage
+        // impact is unique per opened cell so repeated crossings cannot farm it.
+        var interventionOutcomeValue = _bloomFoodHarvested * 0.1f +
+                                       _beaconArrivals * 2f +
+                                       _insightFoodArrivals * 0.75f +
+                                       _insightFoodHarvested * 1.25f +
+                                       _announcedPassageImpactCells.Count * 3f;
+        var impactPerResonance = _totalResonanceSpent > 0
+            ? interventionOutcomeValue / _totalResonanceSpent
             : 0f;
-        _scoreEfficiencyComponent = MathF.Min(100f, efficiency * 100f);
+        _scoreEfficiencyComponent = MathF.Min(100f, 10f * MathF.Log2(1f + impactPerResonance));
 
         _scoreTotal = (_scorePopulationComponent + _scoreFoodComponent + _scoreCrisisComponent +
                        _scoreSettlementComponent + _scoreEfficiencyComponent) / 5f;

@@ -37,6 +37,12 @@ namespace Hollowbound.Simulation
         public Rectangle WindowBounds => _windowBounds;
         public float UIScale => _uiScale;
 
+        public static Rectangle ClampWindowBounds(Rectangle bounds) => new(
+            bounds.X,
+            bounds.Y,
+            Math.Max(MinWindowWidth, bounds.Width),
+            Math.Max(MinWindowHeight, bounds.Height));
+
         private int Scaled(int baseValue) => (int)Math.Round(baseValue * _uiScale);
 
         public int TopBarHeight => Math.Max(MinTopBarHeight, Scaled(BaseTopBarHeight));

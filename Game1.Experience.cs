@@ -35,6 +35,10 @@ public sealed partial class Game1
     private Rectangle _debugBounds;
     private bool _showAllEvents;
     private readonly Dictionary<(string Text, int Width, float Scale), List<string>> _wrapCache = new();
+    private readonly List<string> _analyticsWrappedLines = new();
+    private long _analyticsWrappedRevision = -1;
+    private int _analyticsWrappedWidth = -1;
+    private float _analyticsWrappedScale = -1f;
 
     public void ConfigurePlaytest()
     {
@@ -187,15 +191,20 @@ public sealed partial class Game1
     {
         var s = _uiScale;
         var w = Math.Max(48, (int)(70 * s));
-        return new Rectangle(_layout.TopBar.Right - 12 - (4 - index) * (w + 5), 8, w, Math.Min((int)(32 * s), _layout.TopBar.Height - 32));
+        return new Rectangle(_layout.TopBar.Right - 12 - (4 - index) * (w + 5), 8, w,
+            Math.Max(1, Math.Min((int)(32 * s), _layout.TopBar.Height - 32)));
     }
 
     private Rectangle ToolCard(int index)
     {
         var p = _layout.LeftPanel;
         var compact = p.Height < 350;
-        var h = Math.Clamp((p.Height - 115) / 6, 28, (int)(82 * _uiScale));
-        return new Rectangle(p.X + 12, p.Y + (compact ? 55 : 70) + index * (h + (compact ? 6 : 10)), Math.Max(1, p.Width - 24), h);
+        var startY = compact ? 55 : 70;
+        var gap = compact ? 4 : 10;
+        var h = compact
+            ? Math.Max(18, (p.Height - startY - 8 - gap * 3) / 4)
+            : Math.Clamp((p.Height - 115) / 6, 28, (int)(82 * _uiScale));
+        return new Rectangle(p.X + 12, p.Y + startY + index * (h + gap), Math.Max(1, p.Width - 24), h);
     }
 
     private Rectangle MiniMapBounds()
@@ -346,7 +355,7 @@ public sealed partial class Game1
         Text("ВАШЕ ВЛИЯНИЕ", new Rectangle(p.X + 14, p.Y + 15, p.Width - 28, 24), Mint, .86f * s);
         Text($"Доступно: {_world.AvailableResonance} R  /  меняйте условия", new Rectangle(p.X + 14, p.Y + 42, p.Width - 28, 22), Muted, .63f * s);
         var titles = new[] { "01   Цветение", "02   Маяк", "03   Озарение", "04   Проход" };
-        var descriptions = new[] { "Создать пищу рядом.", "Привлечь исследователей.", "Знания: радиус 5 клеток.", "Открыть блок стены." };
+        var descriptions = new[] { "Пища рядом; считаем, сколько агенты собрали.", "Усиливает тягу разведчиков к точке.", "Показывает группе реальный источник еды.", "Открыть стену; считаем проходы жителей." };
         for (var i = 0; i < 4; i++)
         {
             var card = ToolCard(i);
@@ -354,6 +363,12 @@ public sealed partial class Game1
             var tint = i == 0 ? Gold : i == 1 ? Mint : new Color(174, 159, 239);
             UIPrimitives.DrawPanel(_spriteBatch, _pixel, card, selected ? new Color(30, 53, 57) : new Color(20, 33, 41), selected ? tint : UITheme.PanelBorder);
             DrawRect(new Rectangle(card.X, card.Y, 3, card.Height), tint);
+            if (p.Height < 350)
+            {
+                var cost = i == 3 ? "2 R" : "1 R";
+                Text($"{titles[i]}   {cost}", new Rectangle(card.X + 8, card.Y + 1, card.Width - 14, card.Height - 2), tint, .65f * s);
+                continue;
+            }
             Text(titles[i], new Rectangle(card.X + 10, card.Y + 5, card.Width - 42, 24), tint, .87f * s);
             Text(i == 3 ? "2 R" : "1 R", new Rectangle(card.Right - 32, card.Y + 7, 29, 22), Muted, .65f * s);
             Paragraph(descriptions[i], new Rectangle(card.X + 10, card.Y + 32, card.Width - 20, card.Height - 34), .68f * s, Muted);
@@ -468,16 +483,51 @@ public sealed partial class Game1
         Text("ЗДОРОВЬЕ ЭКСПЕРИМЕНТА", new Rectangle(p.X + 14, y, p.Width - 28, 28), Gold, .83f * s);
         DrawPopulationChart(new Rectangle(p.X + 14, y + 38, p.Width - 28, 76));
         y += 130;
-        var data = new[] { ("Население", _world.ScorePopulationComponent), ("Пища", _world.ScoreFoodComponent), ("Устойчивость", _world.ScoreCrisisComponent), ("Поселения", _world.ScoreSettlementComponent), ("Вмешательства", _world.ScoreEfficiencyComponent) };
-        foreach (var (name, value) in data)
+        for (var i = 0; i < _uiCache.ScoreRows.Length; i++)
         {
-            Text($"{name}   {value:0}/100", new Rectangle(p.X + 14, y, p.Width - 28, 24), Muted, .77f * s);
-            Bar(new Rectangle(p.X + 14, y + 25, p.Width - 28, 4), value / 100, Mint);
+            Text(_uiCache.ScoreRows[i], new Rectangle(p.X + 14, y, p.Width - 28, 24), Muted, .77f * s);
+            Bar(new Rectangle(p.X + 14, y + 25, p.Width - 28, 4), _uiCache.ScoreValues[i] / 100f, Mint);
             y += 41;
         }
-        var lines = new[] { $"Рождения {_world.Births} · смерти {_world.Deaths}", $"Голодных жителей: {_world.LowEnergyAgents}", $"Крики {_world.ShoutsMade} · услышано {_world.ShoutsHeard}", $"Проверено сигналов: {_world.ShoutLearningEvents}", $"Успешных уроков: {_world.SuccessfulShoutLessons}", $"Симуляция: {_world.SmoothedActualSpeed:0.#}x / запрос {_timeScale:0}x", "График — последние наблюдения сессии.", "F10 — открыть JSONL-логи для анализа." };
-        lines = new[] { _world.EcologyStatus, $"Съедено {_world.FoodConsumed} · на рождения {_world.Ecology.FoodSpentOnBirths}", $"Испортилось {_world.Ecology.FoodSpoiled} · потери источников {_world.Ecology.DroughtFoodLost}", $"Рост: попыток {_world.Ecology.BirthAttempts}", $"Задержки: родители {_world.Ecology.BirthBlockedParents}, пища {_world.Ecology.BirthBlockedFood}, место {_world.Ecology.BirthBlockedSpace}" }.Concat(lines).ToArray();
-        DrawScrollableText(lines, new Rectangle(p.X + 14, y + 6, p.Width - 28, Math.Max(1, p.Bottom - y - 14)), .76f * s);
+        Text("ДЕЙСТВИЯ → РЕЗУЛЬТАТ", new Rectangle(p.X + 14, y + 1, p.Width - 28, 22), Gold, .76f * s);
+        y += 22;
+        Text("Score экспериментальный · не лидерборд", new Rectangle(p.X + 14, y, p.Width - 28, 21), Muted, .65f * s);
+        y += 23;
+        DrawCachedAnalyticsText(new Rectangle(p.X + 14, y + 6, p.Width - 28, Math.Max(1, p.Bottom - y - 14)), .76f * s);
+    }
+
+    private void DrawCachedAnalyticsText(Rectangle bounds, float scale)
+    {
+        var width = Math.Max(1, bounds.Width - 8);
+        if (_analyticsWrappedRevision != _uiCache.AnalyticsRevision ||
+            _analyticsWrappedWidth != width || Math.Abs(_analyticsWrappedScale - scale) > .001f)
+        {
+            _analyticsWrappedLines.Clear();
+            foreach (var paragraph in _uiCache.AnalyticsLines)
+            {
+                var wrapped = Wrap(paragraph, width, scale);
+                for (var i = 0; i < wrapped.Count; i++)
+                    _analyticsWrappedLines.Add(wrapped[i]);
+            }
+            _analyticsWrappedRevision = _uiCache.AnalyticsRevision;
+            _analyticsWrappedWidth = width;
+            _analyticsWrappedScale = scale;
+        }
+
+        var lineHeight = Math.Max(16, (int)Math.Ceiling(_uiFont.LineSpacing * scale) + 3);
+        var capacity = Math.Max(0, bounds.Height / lineHeight);
+        if (capacity == 0) return;
+        _inspectorScrollOffset = Math.Clamp(_inspectorScrollOffset, 0, Math.Max(0, _analyticsWrappedLines.Count - capacity));
+        for (var i = 0; i < capacity && i + _inspectorScrollOffset < _analyticsWrappedLines.Count; i++)
+            Text(_analyticsWrappedLines[i + _inspectorScrollOffset],
+                new Rectangle(bounds.X, bounds.Y + i * lineHeight, width, lineHeight), UITheme.PrimaryText, scale);
+        if (_analyticsWrappedLines.Count > capacity)
+        {
+            DrawRect(new Rectangle(bounds.Right - 3, bounds.Y, 2, bounds.Height), UITheme.PanelBorder);
+            DrawRect(new Rectangle(bounds.Right - 3,
+                bounds.Y + bounds.Height * _inspectorScrollOffset / _analyticsWrappedLines.Count,
+                2, Math.Max(6, bounds.Height * capacity / _analyticsWrappedLines.Count)), Mint);
+        }
     }
 
     private void DrawArchive()
@@ -514,13 +564,14 @@ public sealed partial class Game1
         void MiniDot(Point cell, Color color) => DrawRect(new Rectangle(r.X + cell.X * r.Width / 128, r.Y + cell.Y * r.Height / 80, 2, 2), color);
     }
 
-    private void DrawAtmosphere(Rectangle visible)
+    private void DrawAtmosphere(Rectangle visible, WorldRenderProfile renderProfile)
     {
-        for (var y = visible.Top / 4 * 4; y < visible.Bottom; y += 4)
-        for (var x = visible.Left / 4 * 4; x < visible.Right; x += 4)
+        var atmosphereSpan = renderProfile.AtmosphereCellSpan;
+        for (var y = visible.Top / atmosphereSpan * atmosphereSpan; y < visible.Bottom; y += atmosphereSpan)
+        for (var x = visible.Left / atmosphereSpan * atmosphereSpan; x < visible.Right; x += atmosphereSpan)
         {
             var noise = (int)(unchecked((uint)(x * 73856093 ^ y * 19349663 ^ _world.Seed)) % 6);
-            DrawRect(new Rectangle(x * 8, y * 8, 32, 32), new Color(13 + noise, 24 + noise, 30 + noise));
+            DrawRect(new Rectangle(x * 8, y * 8, atmosphereSpan * 8, atmosphereSpan * 8), new Color(13 + noise, 24 + noise, 30 + noise));
         }
         if (_mapLens == 0) return;
         for (var i = 0; i < _density.Length; i++)
@@ -533,6 +584,7 @@ public sealed partial class Game1
         }
         if (_mapLens == 1)
         {
+            if (!renderProfile.ShouldGlowResources(_mapLens, _camera.Zoom)) return;
             foreach (var food in _world.Food) if (food.Amount > 0 && visible.Contains(food.Cell)) DrawGlow(_camera.CellToWorld(food.Cell), 36, Gold * .8f);
             foreach (var pile in _world.FoodStorage) if (pile.Value > 0 && visible.Contains(pile.Key)) DrawGlow(_camera.CellToWorld(pile.Key), 25, Mint * .55f);
         }
@@ -628,10 +680,11 @@ public sealed partial class Game1
     private void DrawExperienceDebug()
     {
         var vp = _layout.WorldViewport;
-        _debugBounds = new Rectangle(vp.X + 10, vp.Y + 47, Math.Min(340, vp.Width - 20), Math.Min(230, vp.Height - 57));
+        _debugBounds = new Rectangle(vp.X + 10, vp.Y + 47, Math.Min(380, vp.Width - 20), Math.Min(270, vp.Height - 57));
         if (_debugBounds.Height < 30) return;
         UIPrimitives.DrawPanel(_spriteBatch, _pixel, _debugBounds, Ink, Gold);
-        Clip(_debugBounds, () => Paragraph($"DIAGNOSTICS / F3\nFPS {_displayFps:0}   Tick {_world.Tick:N0}\nActive {_world.ActiveAgentCount} / dormant {_world.DormantAgentCount}\nProxy coverage {_world.AggregatedAgentCount}\nWorld {StopwatchTicksToMilliseconds(_lastWorldDrawTicks):0.00} ms / UI {StopwatchTicksToMilliseconds(_lastUIDrawTicks):0.00} ms\nBacklog {_world.BacklogSeconds:0.00}s\nSeed {_world.Seed}\nСигналы {_world.ShoutsMade} / услышано {_world.ShoutsHeard}\nЖивых колоний {_livingSettlements.Count}\nF10 — папка аналитики", Inset(_debugBounds, 10), .72f, Muted));
+        var profile = _world.StepPerformance;
+        Clip(_debugBounds, () => Paragraph($"DIAGNOSTICS / F3\nFPS {_displayFps:0}   Tick {_world.Tick:N0}\nActive {_world.ActiveAgentCount} / dormant {_world.DormantAgentCount}\nProxy coverage {_world.AggregatedAgentCount}\nRender: world {StopwatchTicksToMilliseconds(_lastWorldDrawTicks):0.00} / UI {StopwatchTicksToMilliseconds(_lastUIDrawTicks):0.00} ms\nTick p50/p95 {profile.Total.P50Milliseconds:0.##}/{profile.Total.P95Milliseconds:0.##} ms ({profile.Total.Samples} recent samples)\nTick p95: agent loop (+pathfinding) {profile.AgentLoop.P95Milliseconds:0.##} / distance-grid prep {profile.DistanceGridPreparation.P95Milliseconds:0.##} / other (+LOD) {profile.OtherWork.P95Milliseconds:0.##} ms\nBacklog {_world.BacklogSeconds:0.00}s\nSeed {_world.Seed}\nСигналы {_world.ShoutsMade} / услышано {_world.ShoutsHeard}\nЖивых колоний {_livingSettlements.Count}\nF10 — папка аналитики", Inset(_debugBounds, 10), .72f, Muted));
     }
 
     private Rectangle MenuBounds() => new(Math.Max(8, (Window.ClientBounds.Width - 600) / 2), Math.Max(8, (Window.ClientBounds.Height - 550) / 2), Math.Min(600, Window.ClientBounds.Width - 16), Math.Min(550, Window.ClientBounds.Height - 16));

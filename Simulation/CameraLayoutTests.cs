@@ -23,6 +23,7 @@ namespace Hollowbound.Simulation.Tests
             TestFitWorld();
             TestVisibleCellBounds();
             TestSmallWindow();
+            TestWindowMinimumClamp();
             TestBelowMinimumWindowRemainsValid();
             TestStandardResolutions();
             TestUltrawide();
@@ -33,7 +34,8 @@ namespace Hollowbound.Simulation.Tests
                         TestDecisionExplanation();
                         TestResponsiveLayoutMinPanelWidths();
                         TestUIScaleAllScales();
-                        TestUIInputIsolation();
+            TestUIInputIsolation();
+            TestWorldRenderProfiles();
 
                         Console.WriteLine("All tests passed!");
         }
@@ -233,6 +235,15 @@ namespace Hollowbound.Simulation.Tests
                 throw new Exception($"Below-minimum resize produced overlapping regions: viewport={viewport}, right={layout.RightPanel}, bottom={layout.BottomPanel}");
 
             Console.WriteLine("  [PASS] Below-minimum resize keeps a valid viewport");
+        }
+
+        private static void TestWindowMinimumClamp()
+        {
+            var clamped = GameLayout.ClampWindowBounds(new Rectangle(0, 0, 320, 180));
+            if (clamped.Width != GameLayout.MinWindowWidth || clamped.Height != GameLayout.MinWindowHeight)
+                throw new Exception($"Window minimum clamp failed: {clamped}");
+
+            Console.WriteLine("  [PASS] Window resize clamps to control-safe minimum");
         }
 
         private static void TestStandardResolutions()
@@ -443,7 +454,7 @@ namespace Hollowbound.Simulation.Tests
                         Console.WriteLine("  [PASS] All 4 UI scales (75/100/125/150%) produce valid layout");
                     }
 
-                    private static void TestUIInputIsolation()
+        private static void TestUIInputIsolation()
                     {
                         // Test that UI panels correctly reject world viewport clicks
                         var layout = new GameLayout(new Rectangle(0, 0, 1280, 720));
@@ -472,7 +483,29 @@ namespace Hollowbound.Simulation.Tests
                         // This is a logic test - the camera only zooms if mouse is in WorldViewport
                         // (verified by HandleCameraInput checking IsPointInWorldViewport)
 
-                        Console.WriteLine("  [PASS] UI input isolation prevents clicks/wheel on UI from affecting world");
-                    }
+            Console.WriteLine("  [PASS] UI input isolation prevents clicks/wheel on UI from affecting world");
+        }
+
+        private static void TestWorldRenderProfiles()
+        {
+            var overview = WorldRenderProfile.Create(1.2f, new Rectangle(0, 0, 128, 80));
+            if (overview.VisibleCellCount != 128 * 80 || overview.WallDetail != 0 ||
+                overview.EntityGlow || overview.FineGrid || overview.AtmosphereCellSpan != 8)
+                throw new Exception("Wide-view rendering did not select the low-cost overview profile");
+
+            var regional = WorldRenderProfile.Create(1.5f, new Rectangle(10, 10, 70, 70));
+            if (regional.WallDetail != 1 || !regional.DetailedAgents || regional.EntityGlow)
+                throw new Exception("Regional rendering did not preserve agent detail while limiting glow work");
+
+            var close = WorldRenderProfile.Create(3f, new Rectangle(40, 20, 40, 40));
+            if (close.WallDetail != 2 || !close.DetailedAgents || !close.EntityGlow || !close.FineGrid)
+                throw new Exception("Close rendering did not restore high-detail visuals");
+
+            var invalid = WorldRenderProfile.Create(float.NaN, new Rectangle(0, 0, -10, int.MaxValue));
+            if (invalid.VisibleCellCount != 0 || invalid.AtmosphereCellSpan is not (4 or 6 or 8))
+                throw new Exception("Render profile failed to sanitize invalid zoom or bounds");
+
+            Console.WriteLine("  [PASS] World render detail scales with zoom and visible area");
+        }
                 }
             }

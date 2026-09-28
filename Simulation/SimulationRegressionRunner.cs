@@ -7,6 +7,7 @@ using System.Linq;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using Microsoft.Xna.Framework;
 
 namespace Hollowbound.Simulation;
@@ -24,6 +25,7 @@ namespace Hollowbound.Simulation;
 ///  3. v10            - legacy snapshot compatibility (no chunks/settlements/goals),
 ///                       chunk rebuild, LOD recalculation, 600-tick continuation.
 ///  4. soak           - fixed-seed smoke run with periodic invariant sweeps.
+///  5. profiler       - deterministic phase coverage and bounded sample summaries.
 /// </summary>
 public static class SimulationRegressionRunner
 {
@@ -99,14 +101,357 @@ public static class SimulationRegressionRunner
             Execute("passage", RunPassage);
         if (scenario is "all" or "ecology")
             Execute("ecology", RunEcology);
+        if (scenario is "all" or "profiler")
+            Execute("profiler", RunProfiler);
+        if (scenario is "all" or "pathfinder")
+            Execute("pathfinder", RunPathfinder);
+        if (scenario is "all" or "resource-index")
+            Execute("resource-index", RunResourceIndex);
+        if (scenario is "all" or "analytics")
+            Execute("analytics", RunAnalyticsSegmentation);
         if (scenario is "multi-seed" or "multiseed")
             Execute("multi-seed", RunMultiSeed);
 
         started.Stop();
         Console.WriteLine(executed > 0
             ? $"Result: {(failures == 0 ? "PASS" : "FAIL")} ({executed - failures}/{executed} scenarios, {started.Elapsed.TotalSeconds:F1}s)"
-            : "Unknown scenario. Expected: all | roundtrip | continuation | v10 | chronicle | soak | responsiveness | interventions | shouts | settlements | passage | ecology | multi-seed");
+            : "Unknown scenario. Expected: all | roundtrip | continuation | v10 | chronicle | soak | responsiveness | interventions | shouts | settlements | passage | ecology | profiler | pathfinder | resource-index | analytics | multi-seed");
         return executed == 0 || failures > 0 ? 1 : 0;
+    }
+
+    private static string RunProfiler()
+    {
+        int[] periods = { 2, 5, 10, 25, 50, 200 };
+        var phaseCoverage = new bool[periods.Length][];
+        for (var i = 0; i < periods.Length; i++)
+            phaseCoverage[i] = new bool[periods[i]];
+
+        var coverageTicks = StepPerformanceProfiler.SampleIntervalTicks * periods[^1];
+        var schedule = new bool[coverageTicks + 1];
+        var sampleCount = 0;
+        long previousSampleTick = 0;
+        for (var tick = 1; tick <= coverageTicks; tick++)
+        {
+            var shouldSample = StepPerformanceProfiler.ShouldSample(tick);
+            schedule[tick] = shouldSample;
+            if (!shouldSample)
+                continue;
+
+            sampleCount++;
+            if (tick - previousSampleTick != StepPerformanceProfiler.SampleIntervalTicks)
+                throw new SelfTestFailure($"Profiler sampling interval was not bounded and fixed at tick {tick}");
+            previousSampleTick = tick;
+
+            for (var phase = 0; phase < periods.Length; phase++)
+                phaseCoverage[phase][tick % periods[phase]] = true;
+        }
+
+        if (StepPerformanceProfiler.ShouldSample(0) || StepPerformanceProfiler.ShouldSample(-1))
+            throw new SelfTestFailure("Profiler sampled a non-positive tick");
+        if (sampleCount != periods[^1] || sampleCount > coverageTicks / StepPerformanceProfiler.SampleIntervalTicks)
+            throw new SelfTestFailure($"Profiler sample frequency exceeded its bound: {sampleCount} samples over {coverageTicks} ticks");
+
+        for (var tick = 1; tick <= coverageTicks; tick++)
+        {
+            if (schedule[tick] != StepPerformanceProfiler.ShouldSample(tick))
+                throw new SelfTestFailure($"Profiler schedule was not reproducible at tick {tick}");
+        }
+
+        for (var phase = 0; phase < periods.Length; phase++)
+        {
+            for (var remainder = 0; remainder < periods[phase]; remainder++)
+            {
+                if (!phaseCoverage[phase][remainder])
+                    throw new SelfTestFailure($"Profiler never sampled phase {remainder} of the {periods[phase]}-tick schedule");
+            }
+        }
+
+        static long ToStopwatchTicks(double milliseconds) =>
+            (long)Math.Round(Stopwatch.Frequency * milliseconds / 1000d);
+        static bool Near(double actual, double expected) => Math.Abs(actual - expected) < 0.01;
+
+        var lowTotal = ToStopwatchTicks(1.2);
+        var lowAgent = ToStopwatchTicks(0.3);
+        var lowNavigation = ToStopwatchTicks(0.6);
+        var highTotal = ToStopwatchTicks(9.0);
+        var highAgent = ToStopwatchTicks(2.5);
+        var highNavigation = ToStopwatchTicks(4.5);
+        var profiler = new StepPerformanceProfiler();
+        for (var i = 0; i < 300; i++)
+        {
+            if (i < 250)
+                profiler.Record(lowTotal, lowAgent, lowNavigation);
+            else
+                profiler.Record(highTotal, highAgent, highNavigation);
+        }
+
+        var summary = profiler.GetSummary();
+        if (summary.Total.Samples != StepPerformanceProfiler.SampleWindow ||
+            summary.AgentLoop.Samples != StepPerformanceProfiler.SampleWindow ||
+            summary.DistanceGridPreparation.Samples != StepPerformanceProfiler.SampleWindow ||
+            summary.OtherWork.Samples != StepPerformanceProfiler.SampleWindow)
+            throw new SelfTestFailure("Profiler sample ring did not remain bounded at SampleWindow");
+
+        if (!Near(summary.Total.P50Milliseconds, 2.0) || !Near(summary.Total.P95Milliseconds, 16.0) ||
+            !Near(summary.Total.MaxMilliseconds, 9.0) ||
+            !Near(summary.AgentLoop.P50Milliseconds, 0.5) || !Near(summary.AgentLoop.P95Milliseconds, 4.0) ||
+            !Near(summary.AgentLoop.MaxMilliseconds, 2.5) ||
+            !Near(summary.DistanceGridPreparation.P50Milliseconds, 1.0) ||
+            !Near(summary.DistanceGridPreparation.P95Milliseconds, 8.0) ||
+            !Near(summary.DistanceGridPreparation.MaxMilliseconds, 4.5) ||
+            !Near(summary.OtherWork.P50Milliseconds, 0.5) || !Near(summary.OtherWork.P95Milliseconds, 2.0) ||
+            !Near(summary.OtherWork.MaxMilliseconds, 2.0))
+            throw new SelfTestFailure("Profiler percentile buckets or rolling maximum are incorrect");
+
+        // Warm the recording path before measuring it; Record must not allocate.
+        var allocationProbe = new StepPerformanceProfiler();
+        for (var i = 0; i < StepPerformanceProfiler.SampleWindow * 2; i++)
+            allocationProbe.Record(lowTotal, lowAgent, lowNavigation);
+        _ = allocationProbe.GetSummary();
+        var allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+        for (var i = 0; i < 4096; i++)
+            allocationProbe.Record(lowTotal, lowAgent, lowNavigation);
+        var allocatedBytes = GC.GetAllocatedBytesForCurrentThread() - allocatedBefore;
+        if (allocatedBytes != 0)
+            throw new SelfTestFailure($"Profiler recording allocated {allocatedBytes} bytes after warmup");
+
+        return $"cadence={StepPerformanceProfiler.SampleIntervalTicks} phases={string.Join(",", periods)} " +
+               $"coverage_samples={sampleCount} rolling_samples={summary.Total.Samples} record_alloc={allocatedBytes}";
+    }
+
+    private static string RunResourceIndex()
+    {
+        var blocked = new ResourceNode { Cell = new Point(12, 10), Amount = 5 };
+        blocked.ReservedBy.Add(1);
+        blocked.ReservedBy.Add(2);
+        var sameDistanceRight = new ResourceNode { Cell = new Point(13, 10), Amount = 4 };
+        var sameDistanceDown = new ResourceNode { Cell = new Point(10, 13), Amount = 4 };
+        var nextRing = new ResourceNode { Cell = new Point(15, 10), Amount = 3 };
+        var beyondFirstQualifyingRadius = new ResourceNode { Cell = new Point(17, 10), Amount = 9 };
+        var index = new ResourceSpatialIndex();
+        index.Rebuild(new[] { beyondFirstQualifyingRadius, nextRing, blocked, sameDistanceDown, sameDistanceRight });
+
+        var expanding = index.FindNearbyExpanding(
+            new Point(10, 10), agentId: 7, minResults: 3, startRadius: 3, maxRadius: 30);
+        if (expanding.Count != 3 || expanding[0].Node != sameDistanceRight ||
+            expanding[1].Node != sameDistanceDown || expanding[2].Node != nextRing)
+            throw new SelfTestFailure("expanded resource search changed reservation, radius, or stable tie ordering");
+
+        var depleted = new ResourceNode { Cell = new Point(24, 20), Amount = 0 };
+        var regrowthIndex = new ResourceSpatialIndex();
+        regrowthIndex.Rebuild(new[] { depleted });
+        if (regrowthIndex.FindNearby(new Point(24, 20), 2, agentId: 7).Count != 0)
+            throw new SelfTestFailure("depleted food was returned as a valid target");
+
+        depleted.Amount = 4;
+        var laterAdded = new ResourceNode { Cell = new Point(25, 20), Amount = 2 };
+        regrowthIndex.Add(laterAdded);
+        var regrownResults = regrowthIndex.FindNearby(new Point(24, 20), 2, agentId: 7);
+        if (regrownResults.Count != 2 || regrownResults[0].Node != depleted || regrownResults[1].Node != laterAdded)
+            throw new SelfTestFailure("depleted-source regrowth or incremental node registration was not visible");
+
+        return $"expanding_radius=pass stable_order=pass reservations=pass regrowth=pass incremental_add=pass queries={index.QueryCount + regrowthIndex.QueryCount}";
+    }
+
+    private static string RunPathfinder()
+    {
+        var openMap = new Map(40, 30);
+        openMap.InitializeOpen();
+        var openFinder = new PathFinder(openMap);
+        var openPath = openFinder.FindPath(new Point(2, 3), new Point(31, 17));
+        var openDistance = ReferencePathDistance(openMap, new Point(2, 3), new Point(31, 17));
+        if (openPath.Count != openDistance + 1)
+            throw new SelfTestFailure($"A* open-map route was not shortest: path={openPath.Count - 1}, reference={openDistance}");
+        ValidatePath(openMap, openPath, new Point(2, 3), new Point(31, 17));
+
+        var corridorMap = new Map(40, 30);
+        corridorMap.InitializeOpen();
+        for (var y = 1; y < corridorMap.Height - 1; y++)
+        {
+            if (y == 22)
+                continue;
+            corridorMap[20, y] = CellType.Wall;
+        }
+
+        var corridorFinder = new PathFinder(corridorMap);
+        var start = new Point(4, 4);
+        var goal = new Point(35, 25);
+        var corridorPath = corridorFinder.FindPath(start, goal);
+        var corridorDistance = ReferencePathDistance(corridorMap, start, goal);
+        if (corridorPath.Count != corridorDistance + 1)
+            throw new SelfTestFailure($"A* obstacle route was not shortest: path={corridorPath.Count - 1}, reference={corridorDistance}");
+        ValidatePath(corridorMap, corridorPath, start, goal);
+        var cachedPath = corridorFinder.FindPath(start, goal);
+        if (!corridorPath.SequenceEqual(cachedPath) || corridorFinder.PathCacheHits != 1)
+            throw new SelfTestFailure("A* path cache changed a route or did not register its hit");
+
+        for (var y = 0; y < corridorMap.Height; y++)
+            corridorMap[20, y] = CellType.Wall;
+        corridorFinder.InvalidatePathCache();
+        if (corridorFinder.FindPath(start, goal).Count != 0)
+            throw new SelfTestFailure("A* returned a path through a sealed wall barrier");
+
+        return $"open_distance={openDistance} obstacle_distance={corridorDistance} cache=pass corner_cut=prevented barrier=blocked";
+
+        static int ReferencePathDistance(Map map, Point from, Point to)
+        {
+            if (!map.InBounds(from) || !map.InBounds(to) || !map.IsWalkable(from) || !map.IsWalkable(to))
+                return -1;
+
+            var distances = new int[map.Width * map.Height];
+            Array.Fill(distances, -1);
+            var queue = new Queue<Point>();
+            queue.Enqueue(from);
+            distances[from.Y * map.Width + from.X] = 0;
+            while (queue.TryDequeue(out var cell))
+            {
+                var currentDistance = distances[cell.Y * map.Width + cell.X];
+                if (cell == to)
+                    return currentDistance;
+
+                for (var dy = -1; dy <= 1; dy++)
+                {
+                    for (var dx = -1; dx <= 1; dx++)
+                    {
+                        if (dx == 0 && dy == 0)
+                            continue;
+                        var next = new Point(cell.X + dx, cell.Y + dy);
+                        if (!map.IsWalkable(next))
+                            continue;
+                        if (dx != 0 && dy != 0 &&
+                            (!map.IsWalkable(cell.X + dx, cell.Y) || !map.IsWalkable(cell.X, cell.Y + dy)))
+                            continue;
+                        var nextIndex = next.Y * map.Width + next.X;
+                        if (distances[nextIndex] >= 0)
+                            continue;
+                        distances[nextIndex] = currentDistance + 1;
+                        queue.Enqueue(next);
+                    }
+                }
+            }
+
+            return -1;
+        }
+
+        static void ValidatePath(Map map, List<Point> path, Point expectedStart, Point expectedGoal)
+        {
+            if (path.Count == 0 || path[0] != expectedStart || path[^1] != expectedGoal)
+                throw new SelfTestFailure("A* returned an empty or incorrectly-ended path");
+            for (var i = 1; i < path.Count; i++)
+            {
+                var previous = path[i - 1];
+                var cell = path[i];
+                var dx = cell.X - previous.X;
+                var dy = cell.Y - previous.Y;
+                if (Math.Abs(dx) > 1 || Math.Abs(dy) > 1 || (dx == 0 && dy == 0) || !map.IsWalkable(cell))
+                    throw new SelfTestFailure($"A* returned an invalid step at path index {i}");
+                if (dx != 0 && dy != 0 &&
+                    (!map.IsWalkable(previous.X + dx, previous.Y) || !map.IsWalkable(previous.X, previous.Y + dy)))
+                    throw new SelfTestFailure($"A* cut a wall corner at path index {i}");
+            }
+        }
+    }
+
+    private static string RunAnalyticsSegmentation()
+    {
+        var logPath = Path.Combine(Path.GetTempPath(), $"hollowbound-analytics-{Guid.NewGuid():N}.jsonl");
+        try
+        {
+            var original = new EmergentSimulationWorld(321001, 70, enableLod: true);
+            var saved = EmergentSimulationWorld.FromSnapshot(original.CreateSnapshot());
+            var newWorld = new EmergentSimulationWorld(321002, 2, enableLod: true);
+
+            using (var logger = new AnalyticsLogger(logPath))
+            {
+                logger.LogEvent("run_started", original, 1f, paused: true);
+                var firstWorldId = logger.WorldId;
+                var firstSegmentId = logger.WorldSegmentId;
+                logger.LogEvent("saved", original, 1f, paused: true);
+                logger.LogEvent("loaded", saved, 1f, paused: true);
+                if (logger.WorldId != firstWorldId || logger.WorldSegmentId == firstSegmentId)
+                    throw new SelfTestFailure("loading a matching saved state did not continue its world with a new segment id");
+
+                var loadedWorldId = logger.WorldId;
+                var loadedSegmentId = logger.WorldSegmentId;
+                logger.LogEvent("new_world", newWorld, 1f, paused: true);
+                if (logger.WorldId == loadedWorldId || logger.WorldSegmentId == loadedSegmentId)
+                    throw new SelfTestFailure("new world reused a previous world or segment identity");
+                logger.Complete(newWorld, 1f, paused: true, reason: "analytics self-test");
+            }
+
+            using var firstRecord = JsonDocument.Parse(File.ReadLines(logPath).First());
+            var records = File.ReadLines(logPath).Select(line => JsonDocument.Parse(line)).ToList();
+            try
+            {
+                var root = firstRecord.RootElement;
+                if (root.GetProperty("schema_version").GetInt32() != AnalyticsLogger.SchemaVersion ||
+                    !root.TryGetProperty("beacon_arrivals", out _) ||
+                    !root.TryGetProperty("insight_food_arrivals", out _) ||
+                    !root.TryGetProperty("insight_food_harvested", out _))
+                    throw new SelfTestFailure("new analytics schema omitted causal intervention outcome counters");
+
+                var segments = records.Select(document => document.RootElement)
+                    .Where(record => record.TryGetProperty("kind", out var kind) && kind.GetString() == "run_started")
+                    .ToArray();
+                if (segments.Length != 1)
+                    throw new SelfTestFailure("analytics log did not retain the run-start record");
+
+                var summary = records.Select(document => document.RootElement)
+                    .Single(record => record.TryGetProperty("kind", out var kind) && kind.GetString() == "session_summary");
+                if (summary.GetProperty("summary_scope").GetString() != "world_segment_at_session_close" ||
+                    summary.GetProperty("seed").GetInt32() != newWorld.Seed ||
+                    summary.GetProperty("peak_population").GetInt32() != newWorld.AlivePopulation)
+                    throw new SelfTestFailure("final segment summary leaked peak metrics from an earlier world");
+
+                var eventCounts = summary.GetProperty("event_counts");
+                if (eventCounts.GetProperty("new_world").GetInt32() != 1 || eventCounts.TryGetProperty("run_started", out _) ||
+                    eventCounts.TryGetProperty("loaded", out _))
+                    throw new SelfTestFailure("final segment summary mixed event counts from prior worlds/loads");
+
+                var worldIds = records.Select(document => document.RootElement.GetProperty("world_id").GetString()).Distinct().Count();
+                var segmentIds = records.Select(document => document.RootElement.GetProperty("world_segment_id").GetString()).Distinct().Count();
+                if (worldIds != 2 || segmentIds != 3)
+                    throw new SelfTestFailure($"expected two world IDs and three segment IDs, got {worldIds}/{segmentIds}");
+
+                var disabledWriterPath = Path.Combine(Path.GetTempPath(), $"hollowbound-analytics-disabled-{Guid.NewGuid():N}.jsonl");
+                try
+                {
+                    var disabledWriterLogger = new AnalyticsLogger(disabledWriterPath);
+                    using (disabledWriterLogger)
+                    {
+                        var writerField = typeof(AnalyticsLogger).GetField("_writer", BindingFlags.NonPublic | BindingFlags.Instance)
+                            ?? throw new SelfTestFailure("Analytics writer test hook missing");
+                        ((StreamWriter)writerField.GetValue(disabledWriterLogger)!).Dispose();
+                        writerField.SetValue(disabledWriterLogger, null);
+                        var eventWorld = new EmergentSimulationWorld(321003, 2);
+                        var recordEvent = typeof(EmergentSimulationWorld).GetMethod("RecordEvent", BindingFlags.NonPublic | BindingFlags.Instance)
+                            ?? throw new SelfTestFailure("RecordEvent test hook missing");
+                        recordEvent.Invoke(eventWorld, new object?[]
+                        {
+                            WorldEventType.PlayerIntervention, "logger-disabled regression", WorldEventImportance.Major, -1, null
+                        });
+                        disabledWriterLogger.LogWorldEvents(eventWorld);
+                        if (eventWorld.DrainNewChronicleEvents().Count != 0)
+                            throw new SelfTestFailure("Chronicle events accumulated while analytics writer was disabled");
+                    }
+                }
+                finally
+                {
+                    TryDelete(disabledWriterPath);
+                }
+
+                return $"worlds={worldIds} segments={segmentIds} segment_summary=isolated causal_fields=present disabled_writer=drained";
+            }
+            finally
+            {
+                foreach (var document in records)
+                    document.Dispose();
+            }
+        }
+        finally
+        {
+            TryDelete(logPath);
+        }
     }
 
     private static string RunEcology()
@@ -148,29 +493,161 @@ public static class SimulationRegressionRunner
         var isolated = enclosed.Agents.First(x => x.Id == a.Id); isolated.FeedingCooldown = 0;
         if ((bool)feed.Invoke(enclosed, new object[] { isolated })!) throw new SelfTestFailure("Feeding crossed a closed wall");
 
-        var world = new EmergentSimulationWorld(54321, 80);
-        AdvanceExact(world, 3000);
-        if (world.Ecology.Phase != 1) throw new SelfTestFailure("Missing drought warning");
-        var path = TempSavePath();
+        var riskBase = new EmergentSimulationWorld(54321, 80).CreateSnapshot();
+        riskBase.Tick = 3000;
+        riskBase.Ecology = new ColonyEcologyState { NextDroughtTick = 3000, Radius = 18 };
+        riskBase.Food.Clear();
+        riskBase.FoodStorage.Clear();
+        for (var i = 0; i < 24; i++)
+            riskBase.Food.Add(new ResourceSnapshot
+            {
+                Cell = new PointSnapshot { X = 55 + i % 8, Y = 37 + i / 8 },
+                Amount = 8,
+            });
+        foreach (var agent in riskBase.Agents)
+            agent.Cell = new PointSnapshot { X = 64, Y = 40 };
+
+        var evaluateRisk = typeof(EmergentSimulationWorld).GetMethod("EvaluateDroughtRisk", BindingFlags.NonPublic | BindingFlags.Instance)
+            ?? throw new SelfTestFailure("EvaluateDroughtRisk test hook missing");
+        var lowReserveWorld = EmergentSimulationWorld.FromSnapshot(riskBase);
+        var deterministicTwin = EmergentSimulationWorld.FromSnapshot(riskBase);
+        evaluateRisk.Invoke(lowReserveWorld, null);
+        evaluateRisk.Invoke(deterministicTwin, null);
+        var deterministicDiffs = CompareWorlds(lowReserveWorld, deterministicTwin);
+        if (deterministicDiffs.Count > 0)
+            throw new SelfTestFailure("Contextual drought decision was not deterministic", deterministicDiffs);
+        if (lowReserveWorld.Ecology.DroughtChecks != 1 || lowReserveWorld.Ecology.LastDroughtFoodAtRisk < 8 ||
+            lowReserveWorld.Ecology.LastDroughtProbability is <= 0 or > 0.17f)
+            throw new SelfTestFailure("Drought risk did not use a valid local context");
+
+        var blockedReserveSnapshot = EmergentSimulationWorld.FromSnapshot(riskBase).CreateSnapshot();
+        for (var y = 0; y < EmergentSimulationWorld.Height; y++)
+            blockedReserveSnapshot.MapCells[y * EmergentSimulationWorld.Width + 65] = (byte)CellType.Wall;
+        blockedReserveSnapshot.FoodStorage.Add(new StorageSnapshot
+        {
+            Cell = new PointSnapshot { X = 66, Y = 40 },
+            Amount = 1000,
+        });
+        var blockedReserveWorld = EmergentSimulationWorld.FromSnapshot(blockedReserveSnapshot);
+        evaluateRisk.Invoke(blockedReserveWorld, null);
+        if (MathF.Abs(blockedReserveWorld.Ecology.LastDroughtProbability - lowReserveWorld.Ecology.LastDroughtProbability) > 0.0001f)
+            throw new SelfTestFailure("Food stored behind an impassable barrier incorrectly reduced drought risk");
+
+        var rotationSnapshot = new EmergentSimulationWorld(54321, 80).CreateSnapshot();
+        rotationSnapshot.Food.Clear();
+        rotationSnapshot.FoodStorage.Clear();
+        rotationSnapshot.Settlements.Clear();
+        for (var i = 0; i < 9; i++)
+        {
+            rotationSnapshot.Settlements.Add(new SettlementSnapshot
+            {
+                Id = i,
+                FactionId = 0,
+                CenterCell = new PointSnapshot { X = 20 + (i % 3) * 40, Y = 10 + (i / 3) * 30 },
+                Population = 5,
+                AverageEnergy = 50,
+                FoundedTick = 0,
+                LastActiveTick = 3000,
+                Generation = 1,
+                Cohesion = 0.5f,
+            });
+        }
+        rotationSnapshot.Food.Add(new ResourceSnapshot
+        {
+            Cell = new PointSnapshot { X = 100, Y = 10 },
+            Amount = 8,
+        });
+        rotationSnapshot.Tick = 3000;
+        rotationSnapshot.Ecology = new ColonyEcologyState { NextDroughtTick = 3000, Radius = 18 };
+        var firstWindow = EmergentSimulationWorld.FromSnapshot(rotationSnapshot);
+        evaluateRisk.Invoke(firstWindow, null);
+        if (firstWindow.Ecology.LastDroughtFoodAtRisk != 0)
+            throw new SelfTestFailure("Drought scan fixture unexpectedly included its out-of-window small colony");
+
+        rotationSnapshot.Tick = 3500;
+        rotationSnapshot.Ecology = new ColonyEcologyState { NextDroughtTick = 3500, Radius = 18 };
+        var rotatedWindow = EmergentSimulationWorld.FromSnapshot(rotationSnapshot);
+        evaluateRisk.Invoke(rotatedWindow, null);
+        if (rotatedWindow.Ecology.LastDroughtFoodAtRisk != 8 || rotatedWindow.Ecology.LastDroughtProbability <= 0)
+            throw new SelfTestFailure("Rotating drought scan did not eventually consider the small colony");
+
+        var richReserveSnapshot = riskBase;
+        richReserveSnapshot.FoodStorage.Add(new StorageSnapshot
+        {
+            Cell = new PointSnapshot { X = 64, Y = 40 },
+            Amount = 1000,
+        });
+        var richReserveWorld = EmergentSimulationWorld.FromSnapshot(richReserveSnapshot);
+        evaluateRisk.Invoke(richReserveWorld, null);
+        if (richReserveWorld.Ecology.LastDroughtProbability >= lowReserveWorld.Ecology.LastDroughtProbability)
+            throw new SelfTestFailure("Large local reserves did not reduce drought probability");
+
+        // The random warning and its state must survive a real snapshot round trip.
+        var riskPath = TempSavePath();
         try
         {
-            WorldSaveService.Save(world, path);
-            var restored = WorldSaveService.Load(path);
-            AdvanceExact(world, 900); AdvanceExact(restored, 900);
-            if (world.Ecology.Phase != 2) throw new SelfTestFailure("Warning did not become a drought");
-            var diffs = CompareWorlds(world, restored);
-            if (diffs.Count > 0) throw new SelfTestFailure("Drought warning save/load diverged", diffs);
-            WorldSaveService.Save(world, path); restored = WorldSaveService.Load(path);
-            AdvanceExact(world, 1800); AdvanceExact(restored, 1800);
-            diffs = CompareWorlds(world, restored);
-            if (diffs.Count > 0) throw new SelfTestFailure("Active drought save/load diverged", diffs);
-            if (world.Ecology.DroughtsCompleted != 1 || world.Ecology.Phase != 0 || world.FoodConsumed == 0)
-                throw new SelfTestFailure("Drought cycle or real consumption missing");
-            var errors = CheckInvariants(world);
-            if (errors.Count > 0) throw new SelfTestFailure("Ecology invariants", errors);
-            return $"nutrition=conserved remote/blocked_food=rejected independent_births=2 drought_roundtrip=exact eaten={world.FoodConsumed} pop={world.AlivePopulation}";
+            WorldSaveService.Save(lowReserveWorld, riskPath);
+            var restored = WorldSaveService.Load(riskPath);
+            var diffs = CompareWorlds(lowReserveWorld, restored);
+            if (diffs.Count > 0)
+                throw new SelfTestFailure("Contextual drought-risk save/load diverged", diffs);
         }
-        finally { TryDelete(path); }
+        finally { TryDelete(riskPath); }
+
+        // Exercise the telegraphed warning and active phase through save/load
+        // without relying on any one random seed to roll the event.
+        var phaseSnapshot = riskBase;
+        phaseSnapshot.Tick = 3800;
+        phaseSnapshot.Ecology = new ColonyEcologyState
+        {
+            Phase = 1,
+            PhaseEndsTick = 3800,
+            NextDroughtTick = 8300,
+            CenterX = 64,
+            CenterY = 40,
+            Radius = 18,
+            LastDroughtProbability = lowReserveWorld.Ecology.LastDroughtProbability,
+            LastDroughtFoodAtRisk = 192,
+            LastDroughtLocalPopulation = 80,
+            DroughtChecks = 1,
+        };
+        var phaseWorld = EmergentSimulationWorld.FromSnapshot(phaseSnapshot);
+        var updateEcology = typeof(EmergentSimulationWorld).GetMethod("UpdateColonyEcology", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        updateEcology.Invoke(phaseWorld, null);
+        if (phaseWorld.Ecology.Phase != 2) throw new SelfTestFailure("Warning did not become a drought");
+        var phasePath = TempSavePath();
+        try
+        {
+            WorldSaveService.Save(phaseWorld, phasePath);
+            var activeRestored = WorldSaveService.Load(phasePath);
+            var diffs = CompareWorlds(phaseWorld, activeRestored);
+            if (diffs.Count > 0) throw new SelfTestFailure("Active drought save/load diverged", diffs);
+
+            var activeSnapshot = phaseWorld.CreateSnapshot();
+            activeSnapshot.Tick = 3850;
+            phaseWorld = EmergentSimulationWorld.FromSnapshot(activeSnapshot);
+            updateEcology.Invoke(phaseWorld, null);
+            if (phaseWorld.Ecology.DroughtFoodLost <= 0)
+                throw new SelfTestFailure("Drought failed to remove any food in its marked resource area");
+
+            activeSnapshot = phaseWorld.CreateSnapshot();
+            activeSnapshot.Tick = activeSnapshot.Ecology!.PhaseEndsTick;
+            phaseWorld = EmergentSimulationWorld.FromSnapshot(activeSnapshot);
+            updateEcology.Invoke(phaseWorld, null);
+            if (phaseWorld.Ecology.Phase != 0 || phaseWorld.Ecology.DroughtsCompleted != 1)
+                throw new SelfTestFailure("Drought cycle did not resolve cleanly");
+        }
+        finally { TryDelete(phasePath); }
+
+        var profilerWorld = new EmergentSimulationWorld(991, 8);
+        const int profilerProbeTicks = 256;
+        AdvanceExact(profilerWorld, profilerProbeTicks);
+        var expectedProfilerSamples = profilerProbeTicks / StepPerformanceProfiler.SampleIntervalTicks;
+        if (profilerWorld.StepPerformance.Total.Samples != expectedProfilerSamples ||
+            !double.IsFinite(profilerWorld.StepPerformance.Total.P95Milliseconds))
+            throw new SelfTestFailure("Bounded step profiler did not record the expected sample window");
+
+        return $"nutrition=conserved contextual_risk={lowReserveWorld.Ecology.LastDroughtProbability:P1}>{richReserveWorld.Ecology.LastDroughtProbability:P1} drought_food_lost={phaseWorld.Ecology.DroughtFoodLost} profiler_samples={profilerWorld.StepPerformance.Total.Samples}";
     }
 
     private static string RunSettlementStability()
@@ -196,9 +673,22 @@ public static class SimulationRegressionRunner
 
     private static string RunPassage()
     {
-        var original = new EmergentSimulationWorld(12345, 80);
-        AdvanceExact(original, 1200);
-        var target = original.Map.WallCells.OrderBy(c => c.Y).ThenBy(c => c.X).First();
+        var fixture = new EmergentSimulationWorld(12345, 80).CreateSnapshot();
+        fixture.Tick = 1200;
+        fixture.Ecology = new ColonyEcologyState { NextDroughtTick = 3000 };
+        Array.Fill(fixture.MapCells, (byte)CellType.Floor);
+        var target = new Point(EmergentSimulationWorld.Width / 2, EmergentSimulationWorld.Height / 2);
+        for (var y = 0; y < EmergentSimulationWorld.Height; y++)
+            fixture.MapCells[y * EmergentSimulationWorld.Width + target.X] = (byte)CellType.Wall;
+        foreach (var agent in fixture.Agents)
+        {
+            agent.Cell = new PointSnapshot { X = target.X - 1, Y = target.Y };
+            agent.Path.Clear();
+            agent.PathIndex = 0;
+            agent.MoveCooldown = 1000f;
+        }
+        fixture.Chunks.Clear();
+        var original = EmergentSimulationWorld.FromSnapshot(fixture);
         var resonance = original.Resonance;
         if (!original.QueueIntervention(EmergentSimulationWorld.InterventionType.Passage, target).Success)
             throw new SelfTestFailure("Passage was rejected");
@@ -219,9 +709,49 @@ public static class SimulationRegressionRunner
             AdvanceExact(restored, 100);
             var diffs = CompareWorlds(original, restored);
             if (diffs.Count > 0) throw new SelfTestFailure("Passage save/load divergence", diffs);
+
+            var pathFinderField = typeof(EmergentSimulationWorld).GetField("_pathFinder", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new SelfTestFailure("PathFinder test hook missing");
+            var pathFinder = pathFinderField.GetValue(original)!;
+            var findPath = pathFinder.GetType().GetMethod("FindPath")
+                ?? throw new SelfTestFailure("PathFinder.FindPath test hook missing");
+            AgentState? passageAgent = null;
+            List<Point>? route = null;
+            foreach (var candidate in original.Agents.Where(agent => agent.Alive).OrderBy(agent => agent.Id))
+            {
+                var candidatePath = (List<Point>)findPath.Invoke(pathFinder, new object[] { candidate.Cell, target })!;
+                if (candidatePath.Count == 0)
+                    continue;
+                passageAgent = candidate;
+                route = candidatePath;
+                break;
+            }
+            if (passageAgent is null || route is null)
+                throw new SelfTestFailure("Opened passage has no reachable route in the fixture");
+            passageAgent.Path = route;
+            passageAgent.PathIndex = 0;
+            passageAgent.Action = AgentAction.Exploring;
+            var moveAgent = typeof(EmergentSimulationWorld).GetMethod("MoveAgent", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new SelfTestFailure("MoveAgent test hook missing");
+            var guard = 0;
+            while (passageAgent.PathIndex < passageAgent.Path.Count && guard++ < route.Count + 4)
+            {
+                passageAgent.MoveCooldown = 0;
+                moveAgent.Invoke(original, new object[] { passageAgent });
+            }
+            if (original.PlayerPassageTraversals != 1 ||
+                !original.Chronicle.Any(e => e.Description.Contains("Проход работает", StringComparison.Ordinal)))
+                throw new SelfTestFailure("Player-opened passage crossing was not attributed or announced");
+
+            WorldSaveService.Save(original, path);
+            restored = WorldSaveService.Load(path);
+            diffs = CompareWorlds(original, restored);
+            if (diffs.Count > 0)
+                throw new SelfTestFailure("Passage impact state changed after save/load", diffs);
+
             var errors = CheckInvariants(original);
             if (errors.Count > 0) throw new SelfTestFailure("Passage broke world invariants", errors);
-            return "queued_save_load=pass reserved_cost=2 duplicate_rejected=yes continuation=101 ticks";
+            return "queued_save_load=pass reserved_cost=2 duplicate_rejected=yes player_crossing=1 impact_saved=pass";
         }
         finally { if (File.Exists(path)) File.Delete(path); }
     }
@@ -923,8 +1453,20 @@ public static class SimulationRegressionRunner
         AdvanceExact(original, runTicks);
 
         var bloomCell = original.Food.First(node => node.Amount > 0).Cell;
-        var insightCell = original.Agents.First(agent => agent.Alive).Cell;
-        var beaconCell = FindWalkableCell(original, new Point(EmergentSimulationWorld.Width / 2, EmergentSimulationWorld.Height / 2));
+        var insightAgent = original.Agents.First(agent => agent.Alive);
+        var insightCell = insightAgent.Cell;
+        var addFood = typeof(EmergentSimulationWorld).GetMethod("AddFoodNode", BindingFlags.NonPublic | BindingFlags.Instance)
+            ?? throw new SelfTestFailure("AddFoodNode test hook missing");
+        addFood.Invoke(original, new object[] { insightCell, 20 });
+        // AddFoodNode is normally followed by the regular end-of-tick index
+        // rebuild. This fixture mutates between ticks, so mirror that invariant
+        // before comparing a live world with a freshly restored snapshot.
+        var resourceIndexField = typeof(EmergentSimulationWorld).GetField("_resourceIndex", BindingFlags.NonPublic | BindingFlags.Instance)
+            ?? throw new SelfTestFailure("ResourceSpatialIndex test hook missing");
+        ((ResourceSpatialIndex)resourceIndexField.GetValue(original)!).Rebuild(original.Food);
+        insightAgent.HasKnownFood = false;
+        insightAgent.FoodKnowledge = 0;
+        var beaconCell = FindReachableBeaconCell(original, insightCell);
         var commands = new[]
         {
             (EmergentSimulationWorld.InterventionType.Bloom, bloomCell),
@@ -955,6 +1497,14 @@ public static class SimulationRegressionRunner
             if (pendingDiffs.Count > 0)
                 throw new SelfTestFailure("pending intervention queue changed after load", pendingDiffs);
 
+            var tamperedPending = original.CreateSnapshot();
+            tamperedPending.PendingInterventions[0].Cost = -1;
+            var sanitizedPending = EmergentSimulationWorld.FromSnapshot(tamperedPending);
+            AdvanceExact(sanitizedPending, 1);
+            if (sanitizedPending.SuccessfulInterventions != commands.Length - 1 ||
+                sanitizedPending.TotalResonanceSpent != commands.Length - 1 || sanitizedPending.Resonance != 1)
+                throw new SelfTestFailure("malformed saved intervention bypassed canonical cost validation");
+
             AdvanceExact(original, 1);
             AdvanceExact(pendingLoaded, 1);
             var appliedDiffs = CompareWorlds(original, pendingLoaded);
@@ -964,6 +1514,47 @@ public static class SimulationRegressionRunner
             if (original.ActiveBlooms.Count != 1 || original.ActiveBeacons.Count != 1 ||
                 original.SuccessfulInterventions != commands.Length)
                 throw new SelfTestFailure("expected all three interventions to apply exactly once");
+            if (original.InsightAgentsTaught <= 0)
+                throw new SelfTestFailure("Insight did not give a nearby agent a usable food clue");
+            if (original.BeaconArrivals != 0 || original.InsightFoodArrivals != 0 || original.InsightFoodHarvested != 0)
+                throw new SelfTestFailure("intervention launches were incorrectly counted as completed outcomes");
+
+            var recalculateScore = typeof(EmergentSimulationWorld).GetMethod("RecalculateScore", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new SelfTestFailure("RecalculateScore test hook missing");
+            recalculateScore.Invoke(original, null);
+            var launchOnlyEfficiency = original.ScoreEfficiencyComponent;
+            if (launchOnlyEfficiency != 0f)
+                throw new SelfTestFailure($"launching interventions alone changed impact score: {launchOnlyEfficiency:0.###}");
+
+            // Exercise delayed, observable outcomes on an isolated clone so
+            // verification does not perturb the paired deterministic worlds.
+            var impactProbe = EmergentSimulationWorld.FromSnapshot(original.CreateSnapshot());
+            VerifyBloomImpact(impactProbe);
+            VerifyInsightImpact(impactProbe, insightAgent.Id);
+            VerifyBeaconImpact(impactProbe, insightAgent.Id);
+            recalculateScore.Invoke(impactProbe, null);
+            if (impactProbe.ScoreEfficiencyComponent <= launchOnlyEfficiency)
+                throw new SelfTestFailure("verified intervention outcomes did not increase the provisional impact score");
+
+            var v23Snapshot = original.CreateSnapshot();
+            v23Snapshot.Version = 23;
+            v23Snapshot.BeaconArrivals = 99;
+            v23Snapshot.InsightFoodArrivals = 99;
+            v23Snapshot.InsightFoodHarvested = 99;
+            var v23Loaded = EmergentSimulationWorld.FromSnapshot(v23Snapshot);
+            if (v23Loaded.BeaconArrivals != 0 || v23Loaded.InsightFoodArrivals != 0 || v23Loaded.InsightFoodHarvested != 0)
+                throw new SelfTestFailure("v23 migration incorrectly restored v24-only causal outcome fields");
+
+            var impactPath = TempSavePath();
+            try
+            {
+                WorldSaveService.Save(impactProbe, impactPath);
+                var impactLoaded = WorldSaveService.Load(impactPath);
+                var impactDiffs = CompareWorlds(impactProbe, impactLoaded);
+                if (impactDiffs.Count > 0)
+                    throw new SelfTestFailure("observed intervention outcomes changed after save/load", impactDiffs);
+            }
+            finally { TryDelete(impactPath); }
 
             // Save/load during active temporary effects, then continue through
             // beacon expiry and Bloom expiry.
@@ -998,6 +1589,9 @@ public static class SimulationRegressionRunner
             if (!original.Chronicle.Any(e => e.Type == WorldEventType.PlayerIntervention))
                 throw new SelfTestFailure("Chronicle has no PlayerIntervention event");
 
+            VerifyQueuedResonanceFailureCount();
+            VerifyBeaconFallback();
+
             if (original.QueueIntervention(EmergentSimulationWorld.InterventionType.Bloom, new Point(-1, -1)).Success ||
                 original.QueueIntervention(EmergentSimulationWorld.InterventionType.None, bloomCell).Success)
                 throw new SelfTestFailure("invalid intervention command was accepted");
@@ -1011,21 +1605,181 @@ public static class SimulationRegressionRunner
             TryDelete(activePath);
         }
 
-        static Point FindWalkableCell(EmergentSimulationWorld world, Point center)
+        static Point FindReachableBeaconCell(EmergentSimulationWorld world, Point origin)
         {
-            for (var radius = 0; radius < 20; radius++)
+            var pathFinderField = typeof(EmergentSimulationWorld).GetField("_pathFinder", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new SelfTestFailure("PathFinder test hook missing");
+            var pathFinder = pathFinderField.GetValue(world)!;
+            var findPath = pathFinder.GetType().GetMethod("FindPath")
+                ?? throw new SelfTestFailure("PathFinder.FindPath test hook missing");
+
+            for (var radius = 6; radius <= 30; radius++)
             {
-                for (var y = center.Y - radius; y <= center.Y + radius; y++)
+                for (var y = origin.Y - radius; y <= origin.Y + radius; y++)
                 {
-                    for (var x = center.X - radius; x <= center.X + radius; x++)
+                    for (var x = origin.X - radius; x <= origin.X + radius; x++)
                     {
-                        if (world.Map.InBounds(x, y) && world.Map.IsWalkable(x, y))
-                            return new Point(x, y);
+                        var cell = new Point(x, y);
+                        var distance = Math.Abs(x - origin.X) + Math.Abs(y - origin.Y);
+                        if (distance < 6 || distance > 30 || !world.Map.InBounds(cell) || !world.Map.IsWalkable(cell))
+                            continue;
+                        if (((List<Point>)findPath.Invoke(pathFinder, new object[] { origin, cell })!).Count >= 4)
+                            return cell;
                     }
                 }
             }
 
-            throw new SelfTestFailure("could not find a walkable beacon cell");
+            throw new SelfTestFailure("could not find a reachable beacon cell at a useful distance");
+        }
+
+        static void VerifyBloomImpact(EmergentSimulationWorld world)
+        {
+            var bloom = world.ActiveBlooms.Values.FirstOrDefault()
+                ?? throw new SelfTestFailure("Bloom effect missing from outcome probe");
+            var node = world.Food.FirstOrDefault(food => food.Cell == bloom.Cell && food.Amount > 0)
+                ?? throw new SelfTestFailure("Bloom has no harvestable food in outcome probe");
+            var consume = typeof(EmergentSimulationWorld).GetMethod("ConsumeBloomFood", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new SelfTestFailure("ConsumeBloomFood test hook missing");
+            var before = world.BloomFoodHarvested;
+            node.Amount--;
+            consume.Invoke(world, new object[] { node, true });
+            if (world.BloomFoodHarvested != before + 1 || !bloom.ImpactAnnounced ||
+                !world.Chronicle.Any(e => e.Description.Contains("Цветение дало пищу", StringComparison.Ordinal)))
+                throw new SelfTestFailure("Bloom harvest did not produce a durable, observable impact");
+        }
+
+        static void VerifyBeaconImpact(EmergentSimulationWorld world, int agentId)
+        {
+            var beacon = world.ActiveBeacons.Values.FirstOrDefault()
+                ?? throw new SelfTestFailure("Beacon effect missing from outcome probe");
+            var agent = world.Agents.First(candidate => candidate.Id == agentId);
+            agent.ExplorationDrive = 1f;
+            agent.Intelligence = 1f;
+            agent.Energy = 100f;
+            agent.Role = AgentRole.Scout;
+            agent.Action = AgentAction.Idle;
+            agent.ExplorationCooldown = 0;
+            var arrivalsBefore = world.BeaconArrivals;
+            var startExploration = typeof(EmergentSimulationWorld).GetMethod("TryStartExploration", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new SelfTestFailure("TryStartExploration test hook missing");
+            for (var attempt = 0; attempt < 100 && beacon.ExplorationTrips == 0; attempt++)
+            {
+                agent.ExplorationCooldown = 0;
+                agent.Path.Clear();
+                agent.PathIndex = 0;
+                startExploration.Invoke(world, new object[] { agent });
+            }
+
+            if (beacon.ExplorationTrips == 0 || !beacon.ImpactAnnounced || world.BeaconExplorationStarts == 0 ||
+                !world.Chronicle.Any(e => e.Description.Contains("Маяк сработал", StringComparison.Ordinal)))
+                throw new SelfTestFailure("Beacon did not cause an observable exploration outcome");
+
+            // Reaching the selected Beacon target is a distinct outcome from
+            // merely starting an exploration trip.
+            var updateState = typeof(EmergentSimulationWorld).GetMethod("UpdateAgentState", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new SelfTestFailure("UpdateAgentState test hook missing");
+            agent.Cell = agent.TargetCell;
+            agent.Action = AgentAction.Exploring;
+            updateState.Invoke(world, new object[] { agent });
+            if (world.BeaconArrivals != arrivalsBefore + 1)
+                throw new SelfTestFailure("Beacon exploration start was counted without a verified arrival");
+        }
+
+        static void VerifyBeaconFallback()
+        {
+            var world = new EmergentSimulationWorld(8821, 2);
+            var agent = world.Agents.First(candidate => candidate.Alive);
+            var origin = new Point(50, 40);
+            var nearCell = new Point(51, 40);
+            var fartherCell = new Point(60, 40);
+            for (var x = origin.X; x <= fartherCell.X; x++)
+                world.Map[x, origin.Y] = CellType.Floor;
+
+            var pathFinderField = typeof(EmergentSimulationWorld).GetField("_pathFinder", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new SelfTestFailure("PathFinder test hook missing");
+            var pathFinder = pathFinderField.GetValue(world)!;
+            var invalidate = pathFinder.GetType().GetMethod("InvalidatePathCache")
+                ?? throw new SelfTestFailure("PathFinder.InvalidatePathCache test hook missing");
+            invalidate.Invoke(pathFinder, null);
+            agent.Cell = origin;
+            agent.ExplorationDrive = 1f;
+            agent.Intelligence = 1f;
+            agent.Energy = 100f;
+            agent.Role = AgentRole.Scout;
+            agent.Action = AgentAction.Idle;
+            agent.ExplorationCooldown = 0;
+
+            var beaconsField = typeof(EmergentSimulationWorld).GetField("_activeBeacons", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new SelfTestFailure("ActiveBeacons test hook missing");
+            var beacons = (Dictionary<Point, EmergentSimulationWorld.BeaconEffect>)beaconsField.GetValue(world)!;
+            beacons[nearCell] = new EmergentSimulationWorld.BeaconEffect { Cell = nearCell, RemainingTicks = 100, Strength = 1f };
+            beacons[fartherCell] = new EmergentSimulationWorld.BeaconEffect { Cell = fartherCell, RemainingTicks = 100, Strength = 1f };
+
+            var startExploration = typeof(EmergentSimulationWorld).GetMethod("TryStartExploration", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new SelfTestFailure("TryStartExploration test hook missing");
+            for (var attempt = 0; attempt < 100 && !agent.HasBeaconTarget; attempt++)
+            {
+                agent.ExplorationCooldown = 0;
+                agent.Path.Clear();
+                agent.PathIndex = 0;
+                startExploration.Invoke(world, new object[] { agent });
+            }
+
+            if (!agent.HasBeaconTarget || agent.BeaconTargetCell != fartherCell ||
+                beacons[nearCell].ExplorationTrips != 0 || beacons[fartherCell].ExplorationTrips != 1)
+                throw new SelfTestFailure("unusable nearest Beacon prevented selection of a farther viable Beacon");
+        }
+
+        static void VerifyQueuedResonanceFailureCount()
+        {
+            var world = new EmergentSimulationWorld(8822, 2);
+            var foodCell = world.Food.First(node => node.Amount > 0).Cell;
+            if (!world.QueueIntervention(EmergentSimulationWorld.InterventionType.Bloom, foodCell).Success)
+                throw new SelfTestFailure("could not queue insufficient-Resonance regression command");
+
+            var resonance = typeof(EmergentSimulationWorld).GetField("_resonance", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new SelfTestFailure("Resonance test hook missing");
+            resonance.SetValue(world, 0);
+            AdvanceExact(world, 1);
+            if (world.FailedInterventions != 1 || world.SuccessfulInterventions != 0 || world.Resonance != 0)
+                throw new SelfTestFailure("application-time Resonance rejection was not counted exactly once");
+        }
+
+        static void VerifyInsightImpact(EmergentSimulationWorld world, int agentId)
+        {
+            var agent = world.Agents.First(candidate => candidate.Id == agentId);
+            if (!agent.HasInsightFoodClue)
+                throw new SelfTestFailure("Insight clue provenance was not saved on the recipient");
+
+            var target = agent.InsightFoodCell;
+            var setFoodTarget = typeof(EmergentSimulationWorld).GetMethod("SetFoodTarget", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new SelfTestFailure("SetFoodTarget test hook missing");
+            var source = world.Food.FirstOrDefault(food => food.Cell == target && food.Amount > 0)
+                ?? throw new SelfTestFailure("Insight source disappeared before its route could be tested");
+            source.ReservedBy.Clear();
+            agent.Action = AgentAction.Idle;
+            agent.Path.Clear();
+            agent.PathIndex = 0;
+            var arrivalsBefore = world.InsightFoodArrivals;
+            var harvestedBefore = world.InsightFoodHarvested;
+            if (!(bool)setFoodTarget.Invoke(world, new object[] { agent, target })! ||
+                world.InsightFoodRoutesStarted <= 0 || agent.HasInsightFoodClue)
+                throw new SelfTestFailure("Insight clue did not produce a reachable food route and count the consequence");
+
+            // Drive the recipient through the real arrival and harvest branches
+            // without relying on an arbitrary number of movement ticks.
+            var updateState = typeof(EmergentSimulationWorld).GetMethod("UpdateAgentState", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new SelfTestFailure("UpdateAgentState test hook missing");
+            var resolveAction = typeof(EmergentSimulationWorld).GetMethod("ResolveAction", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?? throw new SelfTestFailure("ResolveAction test hook missing");
+            agent.Cell = target;
+            agent.Action = AgentAction.GoingToFood;
+            updateState.Invoke(world, new object[] { agent });
+            if (world.InsightFoodArrivals != arrivalsBefore + 1 || agent.Action != AgentAction.GatheringFood)
+                throw new SelfTestFailure("Insight-guided food route did not record arrival at its intended source");
+            resolveAction.Invoke(world, new object[] { agent });
+            if (world.InsightFoodHarvested != harvestedBefore + 1)
+                throw new SelfTestFailure("Insight-guided arrival did not result in attributed food harvest");
         }
     }
 
@@ -1408,6 +2162,9 @@ public static class SimulationRegressionRunner
             Eq(x.KnownFoodCell.X, y.KnownFoodCell.X, $"{p}.known_food_x");
             Eq(x.KnownFoodCell.Y, y.KnownFoodCell.Y, $"{p}.known_food_y");
             EqBool(x.HasKnownFood, y.HasKnownFood, $"{p}.has_known_food");
+            Eq(x.InsightFoodCell.X, y.InsightFoodCell.X, $"{p}.insight_food_x");
+            Eq(x.InsightFoodCell.Y, y.InsightFoodCell.Y, $"{p}.insight_food_y");
+            EqBool(x.HasInsightFoodClue, y.HasInsightFoodClue, $"{p}.has_insight_food_clue");
             EqF(x.FoodKnowledge, y.FoodKnowledge, $"{p}.food_knowledge");
             Eq(x.SuccessfulFoodTrips, y.SuccessfulFoodTrips, $"{p}.successful_trips");
             Eq(x.FailedFoodTrips, y.FailedFoodTrips, $"{p}.failed_trips");
@@ -1698,6 +2455,27 @@ public static class SimulationRegressionRunner
         Eq(left.ShoutLearningEvents, right.ShoutLearningEvents, "shout_learning_events");
         Eq(left.SuccessfulShoutLessons, right.SuccessfulShoutLessons, "successful_shout_lessons");
         Eq(left.FailedShoutLessons, right.FailedShoutLessons, "failed_shout_lessons");
+        Eq(left.BloomFoodHarvested, right.BloomFoodHarvested, "bloom_food_harvested");
+        Eq(left.BeaconExplorationStarts, right.BeaconExplorationStarts, "beacon_exploration_starts");
+        Eq(left.BeaconArrivals, right.BeaconArrivals, "beacon_arrivals");
+        Eq(left.InsightAgentsTaught, right.InsightAgentsTaught, "insight_agents_taught");
+        Eq(left.InsightFoodRoutesStarted, right.InsightFoodRoutesStarted, "insight_food_routes_started");
+        Eq(left.InsightFoodArrivals, right.InsightFoodArrivals, "insight_food_arrivals");
+        Eq(left.InsightFoodHarvested, right.InsightFoodHarvested, "insight_food_harvested");
+        Eq(left.PassageTraversals, right.PassageTraversals, "passage_traversals");
+        Eq(left.PlayerPassageTraversals, right.PlayerPassageTraversals, "player_passage_traversals");
+        var playerPassagesLeft = left.PlayerPassageCells.OrderBy(cell => cell.Y).ThenBy(cell => cell.X).ToArray();
+        var playerPassagesRight = right.PlayerPassageCells.OrderBy(cell => cell.Y).ThenBy(cell => cell.X).ToArray();
+        Eq(playerPassagesLeft.Length, playerPassagesRight.Length, "player_passage_cells");
+        for (var i = 0; i < Math.Min(playerPassagesLeft.Length, playerPassagesRight.Length); i++)
+            if (playerPassagesLeft[i].X != playerPassagesRight[i].X || playerPassagesLeft[i].Y != playerPassagesRight[i].Y)
+                diffs.Add($"interventions.player_passage_cells[{i}] differs");
+        var announcedPassagesLeft = left.AnnouncedPassageImpactCells.OrderBy(cell => cell.Y).ThenBy(cell => cell.X).ToArray();
+        var announcedPassagesRight = right.AnnouncedPassageImpactCells.OrderBy(cell => cell.Y).ThenBy(cell => cell.X).ToArray();
+        Eq(announcedPassagesLeft.Length, announcedPassagesRight.Length, "announced_passage_impacts");
+        for (var i = 0; i < Math.Min(announcedPassagesLeft.Length, announcedPassagesRight.Length); i++)
+            if (announcedPassagesLeft[i].X != announcedPassagesRight[i].X || announcedPassagesLeft[i].Y != announcedPassagesRight[i].Y)
+                diffs.Add($"interventions.announced_passages[{i}] differs");
         Eq(left.FoodCrisisCount, right.FoodCrisisCount, "crises");
         Eq(left.FoodCrisisRecoveredCount, right.FoodCrisisRecoveredCount, "recoveries");
         Eq(left.ScoreLastTick, right.ScoreLastTick, "score_tick");
@@ -1727,7 +2505,8 @@ public static class SimulationRegressionRunner
             var a = bloomsLeft[i];
             var b = bloomsRight[i];
             if (a.Cell.X != b.Cell.X || a.Cell.Y != b.Cell.Y || a.RemainingTicks != b.RemainingTicks ||
-                a.BoostAmount != b.BoostAmount || a.RemainingBoost != b.RemainingBoost || a.CreatedSource != b.CreatedSource)
+                a.BoostAmount != b.BoostAmount || a.RemainingBoost != b.RemainingBoost || a.CreatedSource != b.CreatedSource ||
+                a.HarvestedUnits != b.HarvestedUnits || a.ImpactAnnounced != b.ImpactAnnounced)
                 diffs.Add($"interventions.bloom[{i}] differs");
         }
 
@@ -1739,7 +2518,8 @@ public static class SimulationRegressionRunner
             var a = beaconsLeft[i];
             var b = beaconsRight[i];
             if (a.Cell.X != b.Cell.X || a.Cell.Y != b.Cell.Y || a.RemainingTicks != b.RemainingTicks ||
-                BitConverter.SingleToUInt32Bits(a.Strength) != BitConverter.SingleToUInt32Bits(b.Strength))
+                BitConverter.SingleToUInt32Bits(a.Strength) != BitConverter.SingleToUInt32Bits(b.Strength) ||
+                a.ExplorationTrips != b.ExplorationTrips || a.ImpactAnnounced != b.ImpactAnnounced)
                 diffs.Add($"interventions.beacon[{i}] differs");
         }
 
@@ -1870,6 +2650,7 @@ public static class SimulationRegressionRunner
                         (int)a.Role, Format(a.RoleExperience),
                         a.HomeWallCell.X, a.HomeWallCell.Y, a.HasHomeWall,
                         a.KnownFoodCell.X, a.KnownFoodCell.Y, a.HasKnownFood, Format(a.FoodKnowledge),
+                        a.InsightFoodCell.X, a.InsightFoodCell.Y, a.HasInsightFoodClue,
                         a.SuccessfulFoodTrips, a.FailedFoodTrips, a.FoodEaten, a.ExplorationTrips, a.SharedMemories,
                         a.KnownDangerCell.X, a.KnownDangerCell.Y, a.HasDangerMemory,
                         Format(a.DangerKnowledge), Format(a.RouteKnowledge),
@@ -1952,14 +2733,19 @@ public static class SimulationRegressionRunner
             case "interventions":
                 var snapshot = w.CreateSnapshot();
                 sb.AppendLine($"resonance={snapshot.Resonance};regen={snapshot.ResonanceRegenTick};spent={snapshot.TotalResonanceSpent};success={snapshot.SuccessfulInterventions};failed={snapshot.FailedInterventions}");
+                sb.AppendLine($"outcomes=bloom:{snapshot.BloomFoodHarvested};beacon:{snapshot.BeaconExplorationStarts};insight_clues:{snapshot.InsightAgentsTaught};insight_routes:{snapshot.InsightFoodRoutesStarted};passage:{snapshot.PlayerPassageTraversals}/{snapshot.PassageTraversals}");
+                foreach (var cell in snapshot.PlayerPassageCells.OrderBy(cell => cell.Y).ThenBy(cell => cell.X))
+                    sb.AppendLine($"player_passage={cell.X},{cell.Y}");
+                foreach (var cell in snapshot.AnnouncedPassageImpactCells.OrderBy(cell => cell.Y).ThenBy(cell => cell.X))
+                    sb.AppendLine($"passage_impact_announced={cell.X},{cell.Y}");
                 sb.AppendLine($"score={Format(snapshot.ScorePopulationComponent)};{Format(snapshot.ScoreFoodComponent)};{Format(snapshot.ScoreCrisisComponent)};{Format(snapshot.ScoreSettlementComponent)};{Format(snapshot.ScoreEfficiencyComponent)};{Format(snapshot.ScoreTotal)};tick={snapshot.ScoreLastTick}");
                 sb.AppendLine($"crises={snapshot.FoodCrisisCount};recoveries={snapshot.FoodCrisisRecoveredCount}");
                 foreach (var command in snapshot.PendingInterventions.OrderBy(command => command.RequestedTick).ThenBy(command => command.Cell.Y).ThenBy(command => command.Cell.X))
                     sb.AppendLine($"pending={command.RequestedTick};{command.Type};{command.Cell.X},{command.Cell.Y};{command.Cost}");
                 foreach (var bloom in snapshot.ActiveBlooms.OrderBy(effect => effect.Cell.Y).ThenBy(effect => effect.Cell.X))
-                    sb.AppendLine($"bloom={bloom.Cell.X},{bloom.Cell.Y};{bloom.RemainingTicks};{bloom.BoostAmount};{bloom.RemainingBoost};{bloom.CreatedSource}");
+                    sb.AppendLine($"bloom={bloom.Cell.X},{bloom.Cell.Y};{bloom.RemainingTicks};{bloom.BoostAmount};{bloom.RemainingBoost};{bloom.CreatedSource};{bloom.HarvestedUnits};{bloom.ImpactAnnounced}");
                 foreach (var beacon in snapshot.ActiveBeacons.OrderBy(effect => effect.Cell.Y).ThenBy(effect => effect.Cell.X))
-                    sb.AppendLine($"beacon={beacon.Cell.X},{beacon.Cell.Y};{beacon.RemainingTicks};{Format(beacon.Strength)}");
+                    sb.AppendLine($"beacon={beacon.Cell.X},{beacon.Cell.Y};{beacon.RemainingTicks};{Format(beacon.Strength)};{beacon.ExplorationTrips};{beacon.ImpactAnnounced}");
                 foreach (var entry in snapshot.InterventionLog)
                     sb.AppendLine($"log={entry.Tick};{entry.Type};{entry.Cell.X},{entry.Cell.Y};{entry.Cost};{entry.Success};{entry.Reason}");
                 break;

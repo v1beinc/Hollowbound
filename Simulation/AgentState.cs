@@ -55,12 +55,23 @@ public sealed class AgentState
     public bool HasHomeWall { get; set; }
     public Point KnownFoodCell { get; set; }
     public bool HasKnownFood { get; set; }
+    public Point InsightFoodCell { get; set; }
+    public bool HasInsightFoodClue { get; set; }
     public float FoodKnowledge { get; set; }
     public int SuccessfulFoodTrips { get; set; }
     public int FailedFoodTrips { get; set; }
     public int FoodEaten { get; set; }
     public int ExplorationTrips { get; set; }
     public int SharedMemories { get; set; }
+
+    // First Cycle causal attribution: retain which player-created route an
+    // agent is following until arrival/harvest is either observed or fails.
+    public bool HasInsightRouteAttribution { get; set; }
+    public bool InsightRouteArrived { get; set; }
+    public Point InsightRouteCell { get; set; }
+    public bool HasBeaconTarget { get; set; }
+    public Point BeaconTargetCell { get; set; }
+
     public Point KnownDangerCell { get; set; }
     public bool HasDangerMemory { get; set; }
     public float DangerKnowledge { get; set; }

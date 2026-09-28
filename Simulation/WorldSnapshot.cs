@@ -20,7 +20,11 @@ public sealed class WorldSnapshot
     // v18: bounded multi-signal memory and faction signal reliability.
     // v19: Passage intervention command (older readers must not silently drop it).
     // v20: colony ecology, local birth accounting and persistent drought phases.
-    public const int CurrentVersion = 20;
+    // v21: contextual drought-risk telemetry and intervention outcome counters.
+    // v22: observed first-impact events and attribution for player-opened passages.
+    // v23: persist Insight clue provenance and route-selection outcomes.
+    // v24: causal Beacon/Insight arrival and harvest attribution.
+    public const int CurrentVersion = 24;
     public ColonyEcologyState? Ecology { get; set; }
 
     /// <summary>First save version carrying the full determinism block.</summary>
@@ -28,6 +32,7 @@ public sealed class WorldSnapshot
     public const int AntiReplayVersion = 12;
     public const int FirstCycleVersion = 13;
     public const int FirstCycleScoreCountersVersion = 14;
+    public const int InterventionOutcomeAttributionVersion = 24;
 
     public int Version { get; set; } = CurrentVersion;
     public int Seed { get; set; }
@@ -148,6 +153,19 @@ public sealed class WorldSnapshot
     public int ShoutLearningEvents { get; set; }
     public int SuccessfulShoutLessons { get; set; }
     public int FailedShoutLessons { get; set; }
+    public long BloomFoodHarvested { get; set; }
+    public long BeaconExplorationStarts { get; set; }
+    public long InsightAgentsTaught { get; set; }
+    public long InsightFoodRoutesStarted { get; set; }
+    public long PassageTraversals { get; set; }
+    public long PlayerPassageTraversals { get; set; }
+    public long BeaconArrivals { get; set; }
+    public long InsightFoodArrivals { get; set; }
+    public long InsightFoodHarvested { get; set; }
+    // Passage cells are tracked for impact only when opening them connected
+    // previously disconnected walkable regions.
+    public List<PointSnapshot> PlayerPassageCells { get; set; } = new();
+    public List<PointSnapshot> AnnouncedPassageImpactCells { get; set; } = new();
 }
 
 public sealed class PointSnapshot
@@ -311,12 +329,19 @@ public sealed class AgentSnapshot
     public bool HasHomeWall { get; set; }
     public PointSnapshot KnownFoodCell { get; set; } = new();
     public bool HasKnownFood { get; set; }
+    public PointSnapshot InsightFoodCell { get; set; } = new();
+    public bool HasInsightFoodClue { get; set; }
     public float FoodKnowledge { get; set; }
     public int SuccessfulFoodTrips { get; set; }
     public int FailedFoodTrips { get; set; }
     public int FoodEaten { get; set; }
     public int ExplorationTrips { get; set; }
     public int SharedMemories { get; set; }
+    public bool HasInsightRouteAttribution { get; set; }
+    public bool InsightRouteArrived { get; set; }
+    public PointSnapshot InsightRouteCell { get; set; } = new();
+    public bool HasBeaconTarget { get; set; }
+    public PointSnapshot BeaconTargetCell { get; set; } = new();
     public PointSnapshot KnownDangerCell { get; set; } = new();
     public bool HasDangerMemory { get; set; }
     public float DangerKnowledge { get; set; }
@@ -398,12 +423,19 @@ public sealed class AgentSnapshot
         HasHomeWall = agent.HasHomeWall,
         KnownFoodCell = PointSnapshot.From(agent.KnownFoodCell),
         HasKnownFood = agent.HasKnownFood,
+        InsightFoodCell = PointSnapshot.From(agent.InsightFoodCell),
+        HasInsightFoodClue = agent.HasInsightFoodClue,
         FoodKnowledge = agent.FoodKnowledge,
         SuccessfulFoodTrips = agent.SuccessfulFoodTrips,
         FailedFoodTrips = agent.FailedFoodTrips,
         FoodEaten = agent.FoodEaten,
         ExplorationTrips = agent.ExplorationTrips,
         SharedMemories = agent.SharedMemories,
+        HasInsightRouteAttribution = agent.HasInsightRouteAttribution,
+        InsightRouteArrived = agent.InsightRouteArrived,
+        InsightRouteCell = PointSnapshot.From(agent.InsightRouteCell),
+        HasBeaconTarget = agent.HasBeaconTarget,
+        BeaconTargetCell = PointSnapshot.From(agent.BeaconTargetCell),
         KnownDangerCell = PointSnapshot.From(agent.KnownDangerCell),
         HasDangerMemory = agent.HasDangerMemory,
         DangerKnowledge = agent.DangerKnowledge,
@@ -484,12 +516,19 @@ public sealed class AgentSnapshot
         HasHomeWall = HasHomeWall,
         KnownFoodCell = KnownFoodCell.ToPoint(),
         HasKnownFood = HasKnownFood,
+        InsightFoodCell = InsightFoodCell.ToPoint(),
+        HasInsightFoodClue = HasInsightFoodClue,
         FoodKnowledge = FoodKnowledge,
         SuccessfulFoodTrips = SuccessfulFoodTrips,
         FailedFoodTrips = FailedFoodTrips,
         FoodEaten = FoodEaten,
         ExplorationTrips = ExplorationTrips,
         SharedMemories = SharedMemories,
+        HasInsightRouteAttribution = HasInsightRouteAttribution,
+        InsightRouteArrived = InsightRouteArrived,
+        InsightRouteCell = InsightRouteCell.ToPoint(),
+        HasBeaconTarget = HasBeaconTarget,
+        BeaconTargetCell = BeaconTargetCell.ToPoint(),
         KnownDangerCell = KnownDangerCell.ToPoint(),
         HasDangerMemory = HasDangerMemory,
         DangerKnowledge = DangerKnowledge,
@@ -649,6 +688,8 @@ public sealed class BloomEffectSnapshot
     public int OriginalAmount { get; set; }
     public int RemainingBoost { get; set; }
     public bool CreatedSource { get; set; }
+    public int HarvestedUnits { get; set; }
+    public bool ImpactAnnounced { get; set; }
 }
 
 public sealed class BeaconEffectSnapshot
@@ -656,6 +697,8 @@ public sealed class BeaconEffectSnapshot
     public PointSnapshot Cell { get; set; } = new();
     public int RemainingTicks { get; set; }
     public float Strength { get; set; }
+    public int ExplorationTrips { get; set; }
+    public bool ImpactAnnounced { get; set; }
 }
 
 public static class WorldSaveService

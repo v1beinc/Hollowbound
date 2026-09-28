@@ -4,13 +4,14 @@ using Microsoft.Xna.Framework;
 namespace Hollowbound.Simulation;
 
 /// <summary>
-/// Uniform-grid spatial index for food resource nodes.
-/// Allows efficient nearby food queries instead of scanning all nodes.
+/// Chunked spatial index for food nodes. Nearby searches visit only occupied
+/// resource chunks, then filter exact cells; depleted nodes stay indexed so a
+/// later regrowth can make the same node available without a rebuild.
 /// </summary>
 internal sealed class ResourceSpatialIndex
 {
+    private const int BucketSize = 8;
     private readonly Dictionary<Point, List<ResourceNode>> _buckets = new();
-    private int _lastKnownCount = -1;
 
     public long QueryCount { get; private set; }
     public long RebuildCount { get; private set; }
@@ -19,87 +20,119 @@ internal sealed class ResourceSpatialIndex
     {
         RebuildCount++;
         _buckets.Clear();
-        int count = 0;
         foreach (var node in resources)
+            Add(node);
+    }
+
+    /// <summary>Registers a newly-created node. Amount changes need no index update.</summary>
+    public void Add(ResourceNode node)
+    {
+        var bucketKey = new Point(node.Cell.X / BucketSize, node.Cell.Y / BucketSize);
+        if (!_buckets.TryGetValue(bucketKey, out var bucket))
         {
-            if (node.Amount <= 0)
-                continue;
-
-            if (!_buckets.TryGetValue(node.Cell, out var bucket))
-            {
-                bucket = new List<ResourceNode>(2);
-                _buckets.Add(node.Cell, bucket);
-            }
-
-            bucket.Add(node);
-            count++;
+            bucket = new List<ResourceNode>(4);
+            _buckets.Add(bucketKey, bucket);
         }
-        _lastKnownCount = count;
+
+        bucket.Add(node);
     }
 
     /// <summary>
-    /// Finds food nodes within a given radius of the center point.
-    /// Returns nodes sorted by distance (closest first).
+    /// Finds nodes within a square radius, ordered by Manhattan distance and
+    /// then cell coordinates for stable deterministic selection.
     /// </summary>
     public List<(ResourceNode Node, int Distance)> FindNearby(Point center, int radius, int agentId)
     {
         QueryCount++;
         var results = new List<(ResourceNode Node, int Distance)>();
-
-        for (var y = center.Y - radius; y <= center.Y + radius; y++)
-        {
-            for (var x = center.X - radius; x <= center.X + radius; x++)
-            {
-                var cell = new Point(x, y);
-                if (!_buckets.TryGetValue(cell, out var bucket))
-                    continue;
-
-                foreach (var node in bucket)
-                {
-                    if (node.Amount <= 0 || !node.CanReserve(agentId))
-                        continue;
-
-                    var distance = Math.Abs(node.Cell.X - center.X) + Math.Abs(node.Cell.Y - center.Y);
-                    results.Add((node, distance));
-                }
-            }
-        }
-
-        // Sort by distance, then by cell. List.Sort is unstable, so without the
-        // cell tie-break equal-distance nodes would be ordered by bucket layout
-        // history, which differs between an organic world and a restored one.
-        results.Sort((a, b) =>
-        {
-            var cmp = a.Distance.CompareTo(b.Distance);
-            if (cmp != 0)
-                return cmp;
-            cmp = a.Node.Cell.Y.CompareTo(b.Node.Cell.Y);
-            return cmp != 0 ? cmp : a.Node.Cell.X.CompareTo(b.Node.Cell.X);
-        });
+        CollectRing(center, Math.Max(0, radius), -1, agentId, results);
+        SortResults(results);
         return results;
     }
 
     /// <summary>
-    /// Updates a single resource node in the index without full rebuild.
+    /// Expands the search in the same 3-cell steps as the original query, but
+    /// visits each resource only in the newly-added outer ring and sorts once.
     /// </summary>
-    public void Update(ResourceNode node)
+    public List<(ResourceNode Node, int Distance)> FindNearbyExpanding(
+        Point center,
+        int agentId,
+        int minResults = 1,
+        int startRadius = 3,
+        int maxRadius = 30)
     {
-        // For Bloom effect, the node stays in the same cell, just amount changes.
-        // The FindNearby reads Amount directly from the node, so no index rebuild needed.
-        // This method exists for API completeness.
+        QueryCount++;
+        var results = new List<(ResourceNode Node, int Distance)>();
+        var maximumRadius = Math.Max(0, maxRadius);
+        var radius = System.Math.Min(Math.Max(0, startRadius), maximumRadius);
+        var previousRadius = -1;
+
+        while (true)
+        {
+            CollectRing(center, radius, previousRadius, agentId, results);
+            if (results.Count >= minResults || radius >= maximumRadius)
+                break;
+
+            previousRadius = radius;
+            radius = System.Math.Min(maximumRadius, radius + 3);
+        }
+
+        SortResults(results);
+        return results;
     }
 
-    /// <summary>
-    /// Gets all food nodes within radius, expanding radius until minimum results found or max radius reached.
-    /// </summary>
-    public List<(ResourceNode Node, int Distance)> FindNearbyExpanding(Point center, int agentId, int minResults = 1, int startRadius = 3, int maxRadius = 30)
+    private void CollectRing(
+        Point center,
+        int radius,
+        int previousRadius,
+        int agentId,
+        List<(ResourceNode Node, int Distance)> results)
     {
-        for (int radius = startRadius; radius <= maxRadius; radius += 3)
+        var minX = System.Math.Max(0, center.X - radius);
+        var maxX = System.Math.Min(EmergentSimulationWorld.Width - 1, center.X + radius);
+        var minY = System.Math.Max(0, center.Y - radius);
+        var maxY = System.Math.Min(EmergentSimulationWorld.Height - 1, center.Y + radius);
+        if (minX > maxX || minY > maxY)
+            return;
+
+        var minChunkX = minX / BucketSize;
+        var maxChunkX = maxX / BucketSize;
+        var minChunkY = minY / BucketSize;
+        var maxChunkY = maxY / BucketSize;
+
+        for (var chunkY = minChunkY; chunkY <= maxChunkY; chunkY++)
         {
-            var results = FindNearby(center, radius, agentId);
-            if (results.Count >= minResults)
-                return results;
+            for (var chunkX = minChunkX; chunkX <= maxChunkX; chunkX++)
+            {
+                if (!_buckets.TryGetValue(new Point(chunkX, chunkY), out var bucket))
+                    continue;
+
+                foreach (var node in bucket)
+                {
+                    var dx = System.Math.Abs(node.Cell.X - center.X);
+                    var dy = System.Math.Abs(node.Cell.Y - center.Y);
+                    var chebyshevDistance = System.Math.Max(dx, dy);
+                    if (chebyshevDistance > radius || chebyshevDistance <= previousRadius ||
+                        node.Amount <= 0 || !node.CanReserve(agentId))
+                        continue;
+
+                    results.Add((node, dx + dy));
+                }
+            }
         }
-        return FindNearby(center, maxRadius, agentId);
+    }
+
+    private static void SortResults(List<(ResourceNode Node, int Distance)> results)
+    {
+        results.Sort(static (left, right) =>
+        {
+            var comparison = left.Distance.CompareTo(right.Distance);
+            if (comparison != 0)
+                return comparison;
+            comparison = left.Node.Cell.Y.CompareTo(right.Node.Cell.Y);
+            return comparison != 0
+                ? comparison
+                : left.Node.Cell.X.CompareTo(right.Node.Cell.X);
+        });
     }
 }

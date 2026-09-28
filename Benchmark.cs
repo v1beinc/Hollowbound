@@ -110,6 +110,9 @@ public static class Benchmark
         Console.WriteLine($"Ticks/second: {totalTicksPerSec:N1}");
         Console.WriteLine($"Effective speed: {effectiveSpeed:F2}x (target x{timeScale})");
         Console.WriteLine($"Efficiency: {(effectiveSpeed / timeScale * 100):F1}%");
+        var stepProfile = world.StepPerformance;
+        Console.WriteLine($"Recent tick time p50/p95/max: {stepProfile.Total.P50Milliseconds:0.###}/{stepProfile.Total.P95Milliseconds:0.###}/{stepProfile.Total.MaxMilliseconds:0.###} ms (n={stepProfile.Total.Samples})");
+        Console.WriteLine($"Recent p95 phases: agent loop (incl. per-agent pathfinding)={stepProfile.AgentLoop.P95Milliseconds:0.###} ms, distance-grid prep={stepProfile.DistanceGridPreparation.P95Milliseconds:0.###} ms, other (incl. LOD)={stepProfile.OtherWork.P95Milliseconds:0.###} ms");
         Console.WriteLine($"Final population: {world.AlivePopulation:N0}");
         Console.WriteLine($"Births: {world.Births:N0}");
         Console.WriteLine($"Deaths: {world.Deaths:N0}");
