@@ -67,6 +67,42 @@ public sealed class Map
     public IReadOnlyList<Point> FloorCells => _floorCells;
     public IReadOnlyList<Point> WallCells => _wallCells;
 
+    public byte[] ExportCells()
+    {
+        var cells = new byte[_cells.Length];
+        for (var i = 0; i < _cells.Length; i++)
+            cells[i] = (byte)_cells[i];
+        return cells;
+    }
+
+    public void RestoreCells(IReadOnlyList<byte> cells)
+    {
+        if (cells.Count != _cells.Length)
+            throw new ArgumentException("Map snapshot has an invalid cell count.", nameof(cells));
+
+        _floorCells.Clear();
+        _wallCells.Clear();
+        _doorCells.Clear();
+        _storageCells.Clear();
+
+        for (var i = 0; i < _cells.Length; i++)
+        {
+            var type = (CellType)cells[i];
+            if (!Enum.IsDefined(type))
+                throw new ArgumentException("Map snapshot contains an invalid cell type.", nameof(cells));
+
+            _cells[i] = type;
+            var point = new Point(i % Width, i / Width);
+            switch (type)
+            {
+                case CellType.Floor: _floorCells.Add(point); break;
+                case CellType.Wall: _wallCells.Add(point); break;
+                case CellType.Door: _doorCells.Add(point); break;
+                case CellType.Storage: _storageCells.Add(point); break;
+            }
+        }
+    }
+
     private void UpdateCellLists(int x, int y, CellType oldType, CellType newType)
     {
         var p = new Point(x, y);
@@ -89,20 +125,43 @@ public sealed class Map
     {
         switch (type)
         {
-            case CellType.Floor: _floorCells.Add(p); break;
-            case CellType.Wall: _wallCells.Add(p); break;
-            case CellType.Door: _doorCells.Add(p); break;
-            case CellType.Storage: _storageCells.Add(p); break;
+            case CellType.Floor: AddInGridOrder(_floorCells, p); break;
+            case CellType.Wall: AddInGridOrder(_wallCells, p); break;
+            case CellType.Door: AddInGridOrder(_doorCells, p); break;
+            case CellType.Storage: AddInGridOrder(_storageCells, p); break;
         }
+    }
+
+    private void AddInGridOrder(List<Point> cells, Point point)
+    {
+        var key = point.Y * Width + point.X;
+        var low = 0;
+        var high = cells.Count;
+        while (low < high)
+        {
+            var middle = low + (high - low) / 2;
+            var middleKey = cells[middle].Y * Width + cells[middle].X;
+            if (middleKey < key)
+                low = middle + 1;
+            else
+                high = middle;
+        }
+
+        cells.Insert(low, point);
     }
 
     public void InitializeOpen()
     {
+        _floorCells.Clear();
+        _wallCells.Clear();
+        _doorCells.Clear();
+        _storageCells.Clear();
         for (int y = 0; y < Height; y++)
         {
             for (int x = 0; x < Width; x++)
             {
-                this[x, y] = CellType.Floor;
+                _cells[y * Width + x] = CellType.Floor;
+                _floorCells.Add(new Point(x, y));
             }
         }
     }
@@ -177,6 +236,16 @@ public sealed class Map
         return count;
     }
 
+    public int CountCardinalWalls(Point cell)
+    {
+        var count = 0;
+        if (InBounds(cell.X + 1, cell.Y) && this[cell.X + 1, cell.Y] == CellType.Wall) count++;
+        if (InBounds(cell.X - 1, cell.Y) && this[cell.X - 1, cell.Y] == CellType.Wall) count++;
+        if (InBounds(cell.X, cell.Y + 1) && this[cell.X, cell.Y + 1] == CellType.Wall) count++;
+        if (InBounds(cell.X, cell.Y - 1) && this[cell.X, cell.Y - 1] == CellType.Wall) count++;
+        return count;
+    }
+
     public bool BuildWallSegment(Point start, bool horizontal)
     {
         if (!CanBuildWallSegment(start, horizontal))
@@ -199,7 +268,11 @@ public sealed class Map
         foreach (var wall in _wallCells)
         {
             var distance = Math.Abs(wall.X - from.X) + Math.Abs(wall.Y - from.Y);
-            if (distance < bestDistance)
+            // Tie-break by cell so the result never depends on _wallCells order
+            // (which differs between an organic world and a restored one).
+            if (distance < bestDistance ||
+                (distance == bestDistance && best.HasValue &&
+                 wall.Y * Width + wall.X < best.Value.Y * Width + best.Value.X))
             {
                 best = wall;
                 bestDistance = distance;
@@ -226,7 +299,10 @@ public sealed class Map
                         continue;
 
                     var distance = Math.Abs(approach.X - from.X) + Math.Abs(approach.Y - from.Y);
-                    if (distance < bestDistance)
+                    // Deterministic tie-break independent of _wallCells order.
+                    if (distance < bestDistance ||
+                        (distance == bestDistance && best.HasValue &&
+                         approach.Y * Width + approach.X < best.Value.Y * Width + best.Value.X))
                     {
                         best = approach;
                         bestDistance = distance;
@@ -235,6 +311,33 @@ public sealed class Map
             }
         }
         return best;
+    }
+
+    /// <summary>
+    /// Returns walkable cells adjacent to at least one wall. These are valid
+    /// targets for a distance field; wall cells themselves are not walkable and
+    /// therefore cannot be used as BFS sources.
+    /// </summary>
+    public List<Point> FindWalkableWallApproachCells()
+    {
+        var approaches = new HashSet<Point>();
+        foreach (var wall in _wallCells)
+        {
+            for (var dy = -1; dy <= 1; dy++)
+            {
+                for (var dx = -1; dx <= 1; dx++)
+                {
+                    if (dx == 0 && dy == 0)
+                        continue;
+
+                    var approach = new Point(wall.X + dx, wall.Y + dy);
+                    if (IsWalkable(approach))
+                        approaches.Add(approach);
+                }
+            }
+        }
+
+        return approaches.ToList();
     }
 
     public bool IsNearWall(Point cell)
@@ -296,6 +399,16 @@ public sealed class Map
         return cells[rng.Next(cells.Count)];
     }
 
+    internal Point FindRandomFloorCell(SimulationRandom rng, Rectangle? bounds = null)
+    {
+        var cells = bounds.HasValue
+            ? _floorCells.FindAll(c => bounds.Value.Contains(c))
+            : _floorCells;
+        if (cells.Count == 0)
+            return new Point(Width / 2, Height / 2);
+        return cells[rng.Next(cells.Count)];
+    }
+
     public Point FindRandomStorageCell(Random rng)
     {
         if (_storageCells.Count == 0)
@@ -315,6 +428,18 @@ public sealed class PathFinder
     private readonly Queue<int> _queue = new();
     private readonly int[] _neighbors = new int[8];
 
+    // Path buffer reuse
+    private readonly List<Point> _pathBuffer = new();
+
+    // Simple LRU cache for recent paths (max 64 entries)
+    private readonly Dictionary<(int startIdx, int goalIdx), List<Point>> _pathCache = new();
+    private readonly Queue<(int startIdx, int goalIdx)> _cacheOrder = new();
+    private const int MaxCacheSize = 64;
+
+    public long PathRequests { get; private set; }
+    public long PathCacheHits { get; private set; }
+    public long DistanceGridRequests { get; private set; }
+
     public PathFinder(Map map)
     {
         _map = map;
@@ -328,23 +453,37 @@ public sealed class PathFinder
 
     public List<Point> FindPath(Point start, Point goal)
     {
+        PathRequests++;
+
         if (!_map.InBounds(start) || !_map.InBounds(goal))
-            return new List<Point>();
+            return EmptyPath;
 
         if (!_map.IsWalkable(goal))
-            return new List<Point>();
+            return EmptyPath;
 
         if (start == goal)
-            return new List<Point> { start };
+            return SinglePointPath(start);
+
+        int startIdx = start.Y * _width + start.X;
+        int goalIdx = goal.Y * _width + goal.X;
+
+        // Check cache
+        var cacheKey = (startIdx, goalIdx);
+        if (_pathCache.TryGetValue(cacheKey, out var cachedPath))
+        {
+            PathCacheHits++;
+            // Move to end (LRU)
+            _cacheOrder.Enqueue(cacheKey);
+            // Callers advance and clear their paths. Never expose the cached
+            // mutable list directly or one agent can invalidate another's path.
+            return new List<Point>(cachedPath);
+        }
 
         Array.Fill(_visited, false);
         Array.Fill(_costSoFar, int.MaxValue);
         Array.Fill(_cameFrom, -1);
 
         _queue.Clear();
-        int startIdx = start.Y * _width + start.X;
-        int goalIdx = goal.Y * _width + goal.X;
-
         _queue.Enqueue(startIdx);
         _visited[startIdx] = true;
         _costSoFar[startIdx] = 0;
@@ -377,18 +516,50 @@ public sealed class PathFinder
         }
 
         if (!_visited[goalIdx])
-            return new List<Point>();
+            return EmptyPath;
 
-        var path = new List<Point>();
+        // Build path in buffer
+        _pathBuffer.Clear();
         int currentIdx = goalIdx;
         while (currentIdx != startIdx)
         {
-            path.Add(new Point(currentIdx % _width, currentIdx / _width));
+            _pathBuffer.Add(new Point(currentIdx % _width, currentIdx / _width));
             currentIdx = _cameFrom[currentIdx];
         }
-        path.Add(start);
-        path.Reverse();
-        return path;
+        _pathBuffer.Add(start);
+        _pathBuffer.Reverse();
+
+        // The caller owns and mutates its path (for example, it may clear it
+        // when food is consumed). The cache must therefore keep a separate
+        // immutable-by-convention copy even on a cache miss; sharing `result`
+        // here made future route choices depend on an earlier agent's path
+        // mutation and broke save/load continuation.
+        var result = new List<Point>(_pathBuffer);
+        _pathCache[cacheKey] = new List<Point>(result);
+        _cacheOrder.Enqueue(cacheKey);
+        if (_pathCache.Count > MaxCacheSize)
+        {
+            var oldest = _cacheOrder.Dequeue();
+            _pathCache.Remove(oldest);
+        }
+
+        return result;
+    }
+
+    private static List<Point> EmptyPath => new();
+
+    private static List<Point> SinglePointPath(Point p)
+    {
+        return new List<Point> { p };
+    }
+
+    /// <summary>
+    /// Invalidate path cache when map topology changes (walls built/removed).
+    /// </summary>
+    public void InvalidatePathCache()
+    {
+        _pathCache.Clear();
+        _cacheOrder.Clear();
     }
 
     private int GetNeighbors(int x, int y, int[] neighbors)
@@ -417,5 +588,112 @@ public sealed class PathFinder
             }
         }
         return count;
+    }
+
+    /// <summary>
+    /// Multi-source BFS: computes distance from EVERY walkable cell to the NEAREST target.
+    /// Single BFS pass from all targets simultaneously - O(W×H) instead of O(N×W×H) for N agents.
+    /// Returns distance grid where distance[i] = steps to nearest target, or -1 if unreachable.
+    /// </summary>
+    public int[] ComputeDistanceToNearestTarget(IEnumerable<Point> targets)
+    {
+        DistanceGridRequests++;
+        var distances = new int[_width * _height];
+        Array.Fill(distances, -1);
+
+        _queue.Clear();
+        int enqueued = 0;
+
+        foreach (var target in targets)
+        {
+            if (!_map.InBounds(target) || !_map.IsWalkable(target))
+                continue;
+
+            int idx = target.Y * _width + target.X;
+            if (distances[idx] == -1)
+            {
+                distances[idx] = 0;
+                _queue.Enqueue(idx);
+                enqueued++;
+            }
+        }
+
+        if (enqueued == 0)
+            return distances;
+
+        while (_queue.Count > 0)
+        {
+            int current = _queue.Dequeue();
+            int cx = current % _width;
+            int cy = current / _width;
+            int currentDist = distances[current];
+
+            int neighborCount = GetNeighbors(cx, cy, _neighbors);
+            for (int i = 0; i < neighborCount; i++)
+            {
+                int next = _neighbors[i];
+                if (distances[next] == -1)
+                {
+                    distances[next] = currentDist + 1;
+                    _queue.Enqueue(next);
+                }
+            }
+        }
+
+        return distances;
+    }
+
+    /// <summary>
+    /// Reconstruct path from start to nearest target using precomputed distance grid.
+    /// Returns empty if unreachable.
+    /// </summary>
+    public List<Point> GetPathFromDistanceGrid(Point start, int[] distanceGrid)
+    {
+        if (!_map.InBounds(start))
+            return EmptyPath;
+
+        int startIdx = start.Y * _width + start.X;
+        int dist = distanceGrid[startIdx];
+        if (dist <= 0)
+            return dist == 0 ? SinglePointPath(start) : EmptyPath;
+
+        // Greedy descent on distance grid
+        _pathBuffer.Clear();
+        int currentIdx = startIdx;
+        _pathBuffer.Add(start);
+
+        while (dist > 0)
+        {
+            int cx = currentIdx % _width;
+            int cy = currentIdx / _width;
+
+            int neighborCount = GetNeighbors(cx, cy, _neighbors);
+            int bestNext = -1;
+            int bestDist = int.MaxValue;
+
+            for (int i = 0; i < neighborCount; i++)
+            {
+                int next = _neighbors[i];
+                int nextDist = distanceGrid[next];
+                if (nextDist >= 0 && nextDist < bestDist)
+                {
+                    bestDist = nextDist;
+                    bestNext = next;
+                }
+            }
+
+            if (bestNext == -1 || bestDist >= dist)
+                break;
+
+            currentIdx = bestNext;
+            dist = bestDist;
+            _pathBuffer.Add(new Point(currentIdx % _width, currentIdx / _width));
+        }
+
+        if (dist != 0)
+            return EmptyPath;
+
+        var result = new List<Point>(_pathBuffer);
+        return result;
     }
 }

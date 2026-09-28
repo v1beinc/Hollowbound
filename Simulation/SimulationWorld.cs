@@ -310,7 +310,7 @@ public sealed class LegacySimulationWorld
     private void TryBirth()
     {
         var alive = _agents.Count(a => a.Alive);
-        if (alive >= 250 || FoodStockpile < alive / 2 || _rng.NextDouble() > 0.012)
+        if (alive >= EmergentSimulationWorld.PopulationSafetyLimit || FoodStockpile < alive / 2 || _rng.NextDouble() > 0.012)
             return;
 
         var parents = _agents.Where(a => a.Alive && _map.IsStorage(a.Cell) && a.Energy > 70)
