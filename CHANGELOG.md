@@ -3,6 +3,68 @@
 Этот файл фиксирует pre-alpha историю изменений. Версии здесь не являются
 официальными релизными тегами или обещанием готового коммерческого релиза.
 
+## 0.4.2-alpha.0 — First Cycle Baseline & AI Civilization Direction (2026-09-30)
+
+Кодовый checkpoint для локального commit. Переносимый пакет 0.4.2-alpha.1,
+GUI-проверка и feedback тестеров остаются следующими gate; публичного выпуска нет.
+
+### Stored-food access and bounded pathfinding
+
+- Голодный агент может самостоятельно добраться до доступного колониального
+  запаса по проходимому маршруту, зарезервировать порцию и получить learning
+  outcome. Маршрут и pending reservation восстанавливаются после save/load.
+- Поиск еды, A* и восстановление пути из distance grid используют повторно
+  используемые буферы. Path-cache LRU ограничен 64 узлами, включая cache-hit
+  ordering; regression проверяет независимость маршрутов и bounded cache.
+
+### Reservation lifecycle and validation
+
+- Принят regression второй модели на освобождение колониального резерва при
+  смерти путешественника. Интеграционное ревью выявило ещё два пропущенных случая.
+- Кормление из локального запаса теперь освобождает natural-food reservation
+  перед отменой похода за едой. Save/load восстанавливает pending reservation
+  живого путешественника даже при временно опустевшей куче, сохраняя правила
+  доступа при повторной доставке до обновления агента.
+- Новые ecology fixture воспроизвели обе ошибки до исправления и проверяют
+  cancellation, depletion/reload/replenishment и освобождение заявки.
+- Финальный Release build: 0 warnings/errors; `--self-test all`: 15/15 PASS
+  (255,4 s), camera/layout: 23/23 PASS; все exit 0. Legacy v10/v11 fixtures и
+  12k-tick soak прошли; GUI, packaged release и длительный фон не проверялись.
+- Отчёт интеграции: docs/validation/ROOT_REVIEW_0_4_2.md. Предыдущие результаты
+  второй модели сохранены с указанием состояния до исправлений. Snapshot v24
+  и analytics v5 сохранены; переносимая 0.4.2-alpha.1 ещё не выпущена.
+- Референсная Release-серия после прогрева: 126,5 / 140,5 / 124,5 TPS при
+  seed 12345, 4000 ticks, initial pop 300, requested x500. Прямой запуск DLL
+  дал другую серию; точные launcher/условия записаны отдельно. Ускорение и
+  GUI FPS не заявляются.
+
+### Build identity
+
+- Default product version в assembly metadata согласована с текущим
+  `0.4.2-alpha.0`; build/publish принимает `-p:Version=...`.
+- Добавлены `--version` и `--build-info`: версия, source commit, dirty state при
+  сборке, configuration/SDK/target/RID и отдельные snapshot/analytics contracts.
+- Заголовок окна использует ту же product version и обозначает локальные
+  изменения или отсутствие подтверждённых source metadata. Git нужен только
+  при сборке; неизвестный dirty state не объявляется чистым.
+- Release build прошёл с 0 warnings/errors; CLI/JSON metadata и MSBuild
+  version override/unknown-source fallback проверены, Windows EXE дал JSON
+  и exit 0 через launcher с redirected stdout. Полный simulation baseline
+  проверен отдельно в разделе выше; переносимая alpha и реальный GUI-прогон
+  остаются открытыми gate.
+
+### AI Civilization design reconstruction
+
+- Зафиксировано направление автономной AI-цивилизации: производство, организации,
+  иерархия, экономика, коллективное обучение, вычислительная инфраструктура,
+  фоновая жизнь мира и управление империей.
+- Добавлены VISION.md, TECH_STACK.md и RELEASE_PLAN.md; активный ROADMAP содержит
+  последовательность 0.4.2 → 1.0 с критериями готовности и внешними проверками.
+- Прежний roadmap сохранён в docs/archive; README уточняет текущие и будущие
+  возможности и исправляет устаревшие указания текущего snapshot на v24.
+- Дополнены CHECKPOINT и навигация AGENTS. Это документация; новые механики,
+  зависимости, публикуемые сборки и runtime validation этим пакетом не добавлены.
+
 ## 0.4.1-prealpha — First Cycle: Performance, Ecology & Impact (2026-09-28)
 
 ### Performance and observability

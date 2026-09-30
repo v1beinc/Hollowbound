@@ -84,6 +84,8 @@ public static class AgentDecisionExplainer
 
         if (agent.Energy < 30f)
             reasons.Add($"Low energy ({agent.Energy:0}) raises food and rest priority.");
+        if (agent.Action == AgentAction.GoingToStoredFood)
+            reasons.Add("Following a walkable route to stored colony food.");
         if (agent.CarriedFood > 0)
             reasons.Add($"Carrying {agent.CarriedFood} food toward storage.");
         if (agent.HasKnownFood && agent.Action is AgentAction.SearchingFood or AgentAction.GoingToFood)
@@ -97,6 +99,7 @@ public static class AgentDecisionExplainer
             AgentAction.Exploring => $"Exploration drive {agent.ExplorationDrive:0.00} outweighs known local options.",
             AgentAction.Resting => $"Rest policy bias {agent.RestUtilityBias:0.00} currently wins.",
             AgentAction.CarryingFood or AgentAction.ReturningToWall or AgentAction.StoringFood => "Protecting gathered food by returning it to the colony.",
+            AgentAction.GoingToStoredFood => "Using the colony reserve because nearby natural food is unavailable.",
             AgentAction.GatheringFood or AgentAction.GoingToFood or AgentAction.SearchingFood => $"Food policy bias {agent.FoodUtilityBias:0.00} currently wins.",
             AgentAction.Migrating => "Local pressure makes migration more useful than staying.",
             _ => $"Best learned action score: {agent.LastDecisionScore:0.00}.",

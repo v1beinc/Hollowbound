@@ -36,10 +36,15 @@ public sealed partial class EmergentSimulationWorld
     private readonly Dictionary<Point, int> _foodStorage = new();
     private readonly AgentSpatialIndex _agentIndex = new();
     private readonly ResourceSpatialIndex _resourceIndex = new();
+    // Food targeting is single-threaded; retain candidate buffers between
+    // agent decisions instead of allocating two lists for every search.
+    private readonly List<(ResourceNode Node, int Distance)> _foodSearchScratch = new();
+    private readonly List<(Point Cell, int Score)> _foodSelectionScratch = new();
     private readonly WallSpatialIndex _wallIndex;
     private readonly WorldChunks _chunks;
     private readonly Map _map;
     private readonly PathFinder _pathFinder;
+    private readonly List<Point> _pathSearchScratch = new();
     private float _accumulator;
     private int _nextAgentId;
     private float _birthCooldown;
@@ -960,6 +965,18 @@ public sealed partial class EmergentSimulationWorld
 
         foreach (var storage in snapshot.FoodStorage)
             world._foodStorage[storage.Cell.ToPoint()] = storage.Amount;
+
+        foreach (var agent in world._agents)
+        {
+            // The final unit may be consumed before this traveller updates.
+            // Preserve the pending claim even while the pile is empty so a
+            // replenishment before its next update behaves identically after load.
+            if (!agent.Alive || agent.Action != AgentAction.GoingToStoredFood || !agent.HasFoodTarget)
+                continue;
+
+            world._storedFoodReservations[agent.FoodTargetCell] =
+                world._storedFoodReservations.GetValueOrDefault(agent.FoodTargetCell) + 1;
+        }
 
         world._resourceIndex.Rebuild(world._food);
 
@@ -2152,6 +2169,7 @@ public sealed partial class EmergentSimulationWorld
         {
             agent.CarriedFood--;
             Nourish(agent);
+            CompleteStoredFoodTrip(agent);
             return true;
         }
 
@@ -2166,9 +2184,11 @@ public sealed partial class EmergentSimulationWorld
 
         FoodStockpile = Math.Max(0, FoodStockpile - 1);
         Nourish(agent);
+        CompleteStoredFoodTrip(agent);
 
         if (agent.Energy < 58f && agent.Action is AgentAction.SearchingFood or AgentAction.GoingToFood or AgentAction.Exploring)
         {
+            ReleaseFoodReservation(agent);
             agent.Path.Clear();
             agent.PathIndex = 0;
             agent.Action = AgentAction.Resting;
@@ -2631,7 +2651,7 @@ public sealed partial class EmergentSimulationWorld
                 {
                     agent.Action = AgentAction.GoingToFood;
                 }
-                else
+                else if (!TrySetStoredFoodTarget(agent))
                     ChooseNextAction(agent, includeFood: false);
                 break;
 
@@ -2703,6 +2723,32 @@ public sealed partial class EmergentSimulationWorld
                     agent.Action = AgentAction.SearchingFood;
                     agent.Path.Clear();
                     agent.PathIndex = 0;
+                }
+                break;
+
+            case AgentAction.GoingToStoredFood:
+                if (!agent.HasFoodTarget || !_foodStorage.TryGetValue(agent.FoodTargetCell, out var storedAmount) || storedAmount <= 0)
+                {
+                    ApplyLearning(agent, AgentAction.GoingToStoredFood, -0.15f);
+                    ReleaseFoodReservation(agent);
+                    agent.Path.Clear();
+                    agent.PathIndex = 0;
+                    agent.Action = AgentAction.SearchingFood;
+                }
+                else if (agent.Energy > 65f)
+                {
+                    ReleaseFoodReservation(agent);
+                    agent.Path.Clear();
+                    agent.PathIndex = 0;
+                    agent.Action = AgentAction.Idle;
+                }
+                else if (agent.Cell != agent.FoodTargetCell && (agent.Path.Count == 0 || agent.PathIndex >= agent.Path.Count))
+                {
+                    ApplyLearning(agent, AgentAction.GoingToStoredFood, -0.15f);
+                    ReleaseFoodReservation(agent);
+                    agent.Path.Clear();
+                    agent.PathIndex = 0;
+                    agent.Action = AgentAction.SearchingFood;
                 }
                 break;
 
@@ -3066,6 +3112,7 @@ public sealed partial class EmergentSimulationWorld
             case AgentAction.CarryingFood:
             case AgentAction.ReturningToWall:
             case AgentAction.StoringFood:
+            case AgentAction.GoingToStoredFood:
                 agent.FoodUtilityBias = Math.Clamp(agent.FoodUtilityBias + delta, -2.5f, 2.5f);
                 break;
             case AgentAction.Building:
@@ -3135,13 +3182,9 @@ public sealed partial class EmergentSimulationWorld
         if (!CanBuildAt(chosen))
             return false;
 
-        var path = _pathFinder.FindPath(agent.Cell, chosen);
-        if (path.Count == 0 || path.Count > 18)
+        if (!TryAssignPath(agent, chosen, minPathCells: 1, maxPathCells: 18))
             return false;
 
-        agent.TargetCell = chosen;
-        agent.Path = path;
-        agent.PathIndex = 0;
         agent.Action = AgentAction.Building;
         return true;
     }
@@ -3366,12 +3409,13 @@ public sealed partial class EmergentSimulationWorld
             int agentIdx = agent.Cell.Y * Width + agent.Cell.X;
             if (agentIdx >= 0 && agentIdx < _wallApproachDistanceGrid.Length)
             {
-                var path = _pathFinder.GetPathFromDistanceGrid(agent.Cell, _wallApproachDistanceGrid);
-                if (path.Count > 0)
+                if (_pathFinder.TryGetPathFromDistanceGrid(agent.Cell, _wallApproachDistanceGrid, _pathSearchScratch) &&
+                    _pathSearchScratch.Count > 0)
                 {
-                    agent.Path = path;
+                    agent.Path.Clear();
+                    agent.Path.AddRange(_pathSearchScratch);
                     agent.PathIndex = 0;
-                    agent.TargetCell = path[^1];
+                    agent.TargetCell = agent.Path[^1];
                     return true;
                 }
             }
@@ -3388,9 +3432,22 @@ public sealed partial class EmergentSimulationWorld
 
     private void SetPath(AgentState agent, Point target)
     {
-        agent.Path = _pathFinder.FindPath(agent.Cell, target);
+        _pathFinder.TryFindPath(agent.Cell, target, agent.Path);
         agent.PathIndex = 0;
         agent.TargetCell = target;
+    }
+
+    private bool TryAssignPath(AgentState agent, Point target, int minPathCells = 1, int maxPathCells = int.MaxValue)
+    {
+        if (!_pathFinder.TryFindPath(agent.Cell, target, _pathSearchScratch) ||
+            _pathSearchScratch.Count < minPathCells || _pathSearchScratch.Count > maxPathCells)
+            return false;
+
+        agent.Path.Clear();
+        agent.Path.AddRange(_pathSearchScratch);
+        agent.PathIndex = 0;
+        agent.TargetCell = target;
+        return true;
     }
 
     private bool TryStartExploration(AgentState agent)
@@ -3420,13 +3477,9 @@ public sealed partial class EmergentSimulationWorld
 
         foreach (var candidateBeacon in beaconCandidates)
         {
-            var path = _pathFinder.FindPath(agent.Cell, candidateBeacon.Cell);
-            if (path.Count < 4)
+            if (!TryAssignPath(agent, candidateBeacon.Cell, minPathCells: 4))
                 continue;
 
-            agent.Path = path;
-            agent.PathIndex = 0;
-            agent.TargetCell = candidateBeacon.Cell;
             agent.HasBeaconTarget = true;
             agent.BeaconTargetCell = candidateBeacon.Cell;
             agent.ExplorationCooldown = MathF.Max(4f, 12f - agent.Intelligence * 5f);
@@ -3457,13 +3510,9 @@ public sealed partial class EmergentSimulationWorld
                     if (distance < 8 || target == agent.Cell)
                         continue;
 
-                    var path = _pathFinder.FindPath(agent.Cell, target);
-                    if (path.Count < 4)
+                    if (!TryAssignPath(agent, target, minPathCells: 4))
                         continue;
 
-                    agent.Path = path;
-                    agent.PathIndex = 0;
-                    agent.TargetCell = target;
                     agent.ExplorationCooldown = MathF.Max(4f, 12f - agent.Intelligence * 5f);
                     agent.Action = AgentAction.Exploring;
                     return true;
@@ -3479,13 +3528,9 @@ public sealed partial class EmergentSimulationWorld
             if (distance < 8 || target == agent.Cell)
                 continue;
 
-            var path = _pathFinder.FindPath(agent.Cell, target);
-            if (path.Count < 4)
+            if (!TryAssignPath(agent, target, minPathCells: 4))
                 continue;
 
-            agent.Path = path;
-            agent.PathIndex = 0;
-            agent.TargetCell = target;
             agent.ExplorationCooldown = MathF.Max(4f, 12f - agent.Intelligence * 5f);
             agent.Action = AgentAction.Exploring;
             return true;
@@ -3520,13 +3565,9 @@ public sealed partial class EmergentSimulationWorld
                     if (distance < 15 || target == agent.Cell)
                         continue;
 
-                    var path = _pathFinder.FindPath(agent.Cell, target);
-                    if (path.Count < 8)
+                    if (!TryAssignPath(agent, target, minPathCells: 8))
                         continue;
 
-                    agent.Path = path;
-                    agent.PathIndex = 0;
-                    agent.TargetCell = target;
                     agent.ExplorationCooldown = MathF.Max(8f, 18f - agent.Intelligence * 6f);
                     agent.Action = AgentAction.Migrating;
                     return true;
@@ -3542,13 +3583,9 @@ public sealed partial class EmergentSimulationWorld
             if (distance < 15 || target == agent.Cell)
                 continue;
 
-            var path = _pathFinder.FindPath(agent.Cell, target);
-            if (path.Count < 8)
+            if (!TryAssignPath(agent, target, minPathCells: 8))
                 continue;
 
-            agent.Path = path;
-            agent.PathIndex = 0;
-            agent.TargetCell = target;
             agent.ExplorationCooldown = MathF.Max(8f, 18f - agent.Intelligence * 6f);
             agent.Action = AgentAction.Migrating;
             return true;
@@ -3778,7 +3815,7 @@ public sealed partial class EmergentSimulationWorld
 
         var preferred = agent.Action switch
         {
-            AgentAction.GatheringFood or AgentAction.GoingToFood or AgentAction.ReturningToWall => AgentRole.Forager,
+            AgentAction.GatheringFood or AgentAction.GoingToFood or AgentAction.GoingToStoredFood or AgentAction.ReturningToWall => AgentRole.Forager,
             AgentAction.Building => AgentRole.Builder,
             AgentAction.Exploring => AgentRole.Scout,
             AgentAction.Migrating => AgentRole.Pathfinder,
@@ -3946,7 +3983,7 @@ public sealed partial class EmergentSimulationWorld
 
             // For food, always use FindPath to the specific reserved target
             // Distance grid finds NEAREST target, not necessarily the reserved one
-            agent.Path = _pathFinder.FindPath(agent.Cell, target);
+            _pathFinder.TryFindPath(agent.Cell, target, agent.Path);
             agent.TargetCell = target;  // Also update TargetCell for UpdateAgentState check
 
             if (agent.Path.Count > 0)
@@ -3971,6 +4008,14 @@ public sealed partial class EmergentSimulationWorld
         if (!agent.HasFoodTarget)
             return;
 
+        if (agent.Action == AgentAction.GoingToStoredFood && _storedFoodReservations.TryGetValue(agent.FoodTargetCell, out var storedReservations))
+        {
+            if (storedReservations <= 1)
+                _storedFoodReservations.Remove(agent.FoodTargetCell);
+            else
+                _storedFoodReservations[agent.FoodTargetCell] = storedReservations - 1;
+        }
+
         if (_foodByCell.TryGetValue(agent.FoodTargetCell, out var node))
             node.ReservedBy.Remove(agent.Id);
         agent.HasFoodTarget = false;
@@ -3979,12 +4024,14 @@ public sealed partial class EmergentSimulationWorld
     private Point? FindNearestFood(AgentState agent)
     {
         // Use spatial index for efficient nearby food search
-        var nearby = _resourceIndex.FindNearbyExpanding(agent.Cell, agent.Id, minResults: 1, startRadius: 3, maxRadius: 30);
+        var nearby = _foodSearchScratch;
+        _resourceIndex.FindNearbyExpanding(agent.Cell, agent.Id, nearby, minResults: 1, startRadius: 3, maxRadius: 30);
 
         if (nearby.Count == 0)
             return null;
 
-        var options = new List<(Point Cell, int Score)>();
+        var options = _foodSelectionScratch;
+        options.Clear();
         foreach (var (node, distance) in nearby)
         {
             if (node.Amount <= 0 || !node.CanReserve(agent.Id))
@@ -4012,7 +4059,7 @@ public sealed partial class EmergentSimulationWorld
         if (options.Count == 0)
             return null;
 
-        options.Sort((left, right) => left.Score.CompareTo(right.Score));
+        options.Sort(static (left, right) => left.Score.CompareTo(right.Score));
         var choiceCount = Math.Min(
             options.Count,
             1 + (int)MathF.Round((1f - agent.Intelligence) * 3f + agent.ExplorationDrive * 3f));
@@ -4494,7 +4541,7 @@ public sealed partial class EmergentSimulationWorld
         {
             for (var j = i + 1; j < neighbourCount; j++)
             {
-                if (_pathFinder.FindPath(neighbours[i], neighbours[j]).Count == 0)
+                if (!_pathFinder.TryFindPath(neighbours[i], neighbours[j], _pathSearchScratch))
                 {
                     connectsPreviouslySeparateAreas = true;
                     break;

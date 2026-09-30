@@ -4,6 +4,7 @@
     <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <Version>0.4.2-alpha.0</Version>
     <RollForward>Major</RollForward>
     <PublishReadyToRun>false</PublishReadyToRun>
     <TieredCompilation>false</TieredCompilation>
@@ -28,4 +29,28 @@
     <PackageReference Include="MonoGame.Framework.DesktopGL" Version="3.8.5.1" />
     <PackageReference Include="MonoGame.Content.Builder.Task" Version="3.8.5.1" />
   </ItemGroup>
+  <Target Name="StampHollowboundBuild" BeforeTargets="GetAssemblyAttributes"
+          DependsOnTargets="InitializeSourceControlInformation">
+    <PropertyGroup>
+      <_HollowboundBuildDirty>unknown</_HollowboundBuildDirty>
+    </PropertyGroup>
+    <Exec Condition="'$(SourceRevisionId)' != ''"
+          Command="git --no-optional-locks -C &quot;$(MSBuildProjectDirectory)&quot; status --porcelain --untracked-files=normal"
+          ConsoleToMSBuild="true" IgnoreExitCode="true" IgnoreStandardErrorWarningFormat="true"
+          StandardOutputImportance="Low" StandardErrorImportance="Low" EchoOff="true">
+      <Output TaskParameter="ConsoleOutput" ItemName="_HollowboundGitStatus" />
+      <Output TaskParameter="ExitCode" PropertyName="_HollowboundGitStatusExitCode" />
+    </Exec>
+    <PropertyGroup Condition="'$(_HollowboundGitStatusExitCode)' == '0'">
+      <_HollowboundBuildDirty Condition="'@(_HollowboundGitStatus)' == ''">false</_HollowboundBuildDirty>
+      <_HollowboundBuildDirty Condition="'@(_HollowboundGitStatus)' != ''">true</_HollowboundBuildDirty>
+    </PropertyGroup>
+    <ItemGroup>
+      <AssemblyMetadata Include="SourceCommit" Value="$(SourceRevisionId)" />
+      <AssemblyMetadata Include="BuildDirty" Value="$(_HollowboundBuildDirty)" />
+      <AssemblyMetadata Include="BuildSdk" Value="$(NETCoreSdkVersion)" />
+      <AssemblyMetadata Include="BuildTargetFramework" Value="$(TargetFramework)" />
+      <AssemblyMetadata Include="BuildRuntimeIdentifier" Value="$(RuntimeIdentifier)" />
+    </ItemGroup>
+  </Target>
 </Project>

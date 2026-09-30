@@ -1,4 +1,12 @@
-if (args.Length > 0 && args[0] == "--preview")
+if (args.Length > 0 && args[0] == "--version")
+{
+    Hollowbound.BuildInfo.WriteVersion();
+}
+else if (args.Length > 0 && args[0] == "--build-info")
+{
+    Hollowbound.BuildInfo.WriteJson();
+}
+else if (args.Length > 0 && args[0] == "--preview")
 {
     if (args.Length < 2) throw new ArgumentException("--preview output.png [ticks] [population] [width] [height] [scale] [lens]");
     using var preview = new Hollowbound.Game1();

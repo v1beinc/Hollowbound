@@ -18,6 +18,7 @@ public enum AgentAction : byte
     Digging = 10,
     Exploring = 11,
     Migrating = 12,
+    GoingToStoredFood = 13,
 }
 
 public enum AgentRole : byte

@@ -42,6 +42,15 @@ public sealed class ColonyEcologyState
 public sealed partial class EmergentSimulationWorld
 {
     private static readonly Point[] FoodNeighbours = { new(0, -1), new(-1, 0), new(1, 0), new(0, 1) };
+    private const int StoredFoodSearchRadius = 24;
+    private const int StoredFoodCriticalSearchRadius = 64;
+    private readonly int[] _storedFoodSearchQueue = new int[Width * Height];
+    private readonly int[] _storedFoodSearchParents = new int[Width * Height];
+    private readonly int[] _storedFoodSearchVisited = new int[Width * Height];
+    private readonly List<Point> _storedFoodPathScratch = new();
+    private readonly Dictionary<Point, int> _storedFoodReservations = new();
+    private int _storedFoodSearchGeneration;
+
     public ColonyEcologyState Ecology { get; private set; } = new();
     public Point DroughtCenter => new(Ecology.CenterX, Ecology.CenterY);
     public string EcologyStatus => Ecology.Phase switch
@@ -82,6 +91,99 @@ public sealed partial class EmergentSimulationWorld
             }
         }
         return result;
+    }
+
+    // Hungry agents can travel to colony reserves instead of starving merely
+    // because the nearest pile is farther away than the immediate-feeding radius.
+    // Reused fixed-size BFS buffers keep this recovery path bounded and avoid
+    // allocating a queue/hash set for every hungry agent.
+    private bool TrySetStoredFoodTarget(AgentState agent)
+    {
+        if (!agent.Alive || agent.Energy > 65f || _foodStorage.Count == 0 || !_map.InBounds(agent.Cell))
+            return false;
+
+        if (_storedFoodSearchGeneration == int.MaxValue)
+        {
+            Array.Clear(_storedFoodSearchVisited, 0, _storedFoodSearchVisited.Length);
+            _storedFoodSearchGeneration = 0;
+        }
+
+        var generation = ++_storedFoodSearchGeneration;
+        var start = agent.Cell.Y * Width + agent.Cell.X;
+        var searchRadius = agent.Energy <= 45f ? StoredFoodCriticalSearchRadius : StoredFoodSearchRadius;
+
+        var head = 0;
+        var tail = 0;
+        var distance = 0;
+        _storedFoodSearchQueue[tail++] = start;
+        _storedFoodSearchVisited[start] = generation;
+        _storedFoodSearchParents[start] = -1;
+
+        while (head < tail && distance <= searchRadius)
+        {
+            var levelEnd = tail;
+            while (head < levelEnd)
+            {
+                var index = _storedFoodSearchQueue[head++];
+                var cell = new Point(index % Width, index / Width);
+                var reserved = _storedFoodReservations.GetValueOrDefault(cell);
+                if (_foodStorage.TryGetValue(cell, out var amount) && amount > reserved)
+                {
+                    var path = _storedFoodPathScratch;
+                    path.Clear();
+                    for (var cursor = index; cursor >= 0; cursor = _storedFoodSearchParents[cursor])
+                        path.Add(new Point(cursor % Width, cursor / Width));
+                    path.Reverse();
+
+                    agent.FoodTargetCell = cell;
+                    agent.HasFoodTarget = true;
+                    agent.TargetCell = cell;
+                    agent.Path.Clear();
+                    agent.Path.AddRange(path);
+                    agent.PathIndex = 0;
+                    agent.Action = AgentAction.GoingToStoredFood;
+                    _storedFoodReservations[cell] = reserved + 1;
+                    return true;
+                }
+
+                if (distance == searchRadius)
+                    continue;
+
+                foreach (var direction in FoodNeighbours)
+                {
+                    var next = cell + direction;
+                    if (!_map.InBounds(next) || !_map.IsWalkable(next))
+                        continue;
+
+                    var nextIndex = next.Y * Width + next.X;
+                    if (_storedFoodSearchVisited[nextIndex] == generation)
+                        continue;
+
+                    _storedFoodSearchVisited[nextIndex] = generation;
+                    _storedFoodSearchParents[nextIndex] = index;
+                    _storedFoodSearchQueue[tail++] = nextIndex;
+                }
+            }
+
+            distance++;
+        }
+
+        return false;
+    }
+
+    private void CompleteStoredFoodTrip(AgentState agent)
+    {
+        if (agent.Action != AgentAction.GoingToStoredFood)
+            return;
+
+        ApplyLearning(agent, AgentAction.GoingToStoredFood, 0.25f);
+        ReleaseFoodReservation(agent);
+        agent.Path.Clear();
+        agent.PathIndex = 0;
+        agent.TargetCell = agent.Cell;
+        agent.Action = agent.Energy < 58f ? AgentAction.Resting : AgentAction.Idle;
+        if (agent.Action == AgentAction.Resting)
+            agent.RestTimer = 1.5f;
     }
 
     private bool SpendLocalBirthFood(Point home, int population)

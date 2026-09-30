@@ -445,14 +445,18 @@ public sealed class PathFinder
     // Path buffer reuse
     private readonly List<Point> _pathBuffer = new();
 
-    // Simple LRU cache for recent paths (max 64 entries)
+    // Bounded LRU cache. Linked nodes are moved on hits instead of enqueuing
+    // duplicate keys, which previously let the order queue grow without bound.
     private readonly Dictionary<(int startIdx, int goalIdx), List<Point>> _pathCache = new();
-    private readonly Queue<(int startIdx, int goalIdx)> _cacheOrder = new();
+    private readonly Dictionary<(int startIdx, int goalIdx), LinkedListNode<(int startIdx, int goalIdx)>> _cacheNodes = new();
+    private readonly LinkedList<(int startIdx, int goalIdx)> _cacheOrder = new();
     private const int MaxCacheSize = 64;
 
     public long PathRequests { get; private set; }
     public long PathCacheHits { get; private set; }
     public long DistanceGridRequests { get; private set; }
+    internal int CachedPathCount => _pathCache.Count;
+    internal int PathCacheOrderCount => _cacheOrder.Count;
 
     public PathFinder(Map map)
     {
@@ -468,16 +472,32 @@ public sealed class PathFinder
 
     public List<Point> FindPath(Point start, Point goal)
     {
+        var path = new List<Point>();
+        TryFindPath(start, goal, path);
+        return path;
+    }
+
+    /// <summary>
+    /// Finds a route into caller-owned storage. Reusing the destination avoids
+    /// allocating a fresh mutable path for every agent search or cache hit.
+    /// </summary>
+    public bool TryFindPath(Point start, Point goal, List<Point> path)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        path.Clear();
         PathRequests++;
 
         if (!_map.InBounds(start) || !_map.InBounds(goal))
-            return EmptyPath;
+            return false;
 
         if (!_map.IsWalkable(goal))
-            return EmptyPath;
+            return false;
 
         if (start == goal)
-            return SinglePointPath(start);
+        {
+            path.Add(start);
+            return true;
+        }
 
         int startIdx = start.Y * _width + start.X;
         int goalIdx = goal.Y * _width + goal.X;
@@ -487,11 +507,11 @@ public sealed class PathFinder
         if (_pathCache.TryGetValue(cacheKey, out var cachedPath))
         {
             PathCacheHits++;
-            // Move to end (LRU)
-            _cacheOrder.Enqueue(cacheKey);
-            // Callers advance and clear their paths. Never expose the cached
-            // mutable list directly or one agent can invalidate another's path.
-            return new List<Point>(cachedPath);
+            TouchCacheEntry(cacheKey);
+            // Never expose the cached mutable list directly: agents own and
+            // clear their route buffers independently.
+            path.AddRange(cachedPath);
+            return true;
         }
 
         // A* with an admissible Chebyshev heuristic explores the route corridor
@@ -549,7 +569,7 @@ public sealed class PathFinder
         }
 
         if (_visitStamp[goalIdx] != visitStamp)
-            return EmptyPath;
+            return false;
 
         // Build path in buffer
         _pathBuffer.Clear();
@@ -562,21 +582,36 @@ public sealed class PathFinder
         _pathBuffer.Add(start);
         _pathBuffer.Reverse();
 
-        // The caller owns and mutates its path (for example, it may clear it
-        // when food is consumed). The cache must therefore keep a separate
-        // immutable-by-convention copy even on a cache miss; sharing `result`
-        // here made future route choices depend on an earlier agent's path
-        // mutation and broke save/load continuation.
-        var result = new List<Point>(_pathBuffer);
-        _pathCache[cacheKey] = new List<Point>(result);
-        _cacheOrder.Enqueue(cacheKey);
-        if (_pathCache.Count > MaxCacheSize)
-        {
-            var oldest = _cacheOrder.Dequeue();
-            _pathCache.Remove(oldest);
-        }
+        path.AddRange(_pathBuffer);
+        AddCacheEntry(cacheKey, path);
+        return true;
+    }
 
-        return result;
+    private void TouchCacheEntry((int startIdx, int goalIdx) key)
+    {
+        if (!_cacheNodes.TryGetValue(key, out var node))
+            return;
+
+        _cacheOrder.Remove(node);
+        _cacheOrder.AddLast(node);
+    }
+
+    private void AddCacheEntry((int startIdx, int goalIdx) key, List<Point> path)
+    {
+        // Keep an independent copy: the caller will mutate/reuse its path.
+        _pathCache.Add(key, new List<Point>(path));
+        _cacheNodes.Add(key, _cacheOrder.AddLast(key));
+
+        if (_pathCache.Count <= MaxCacheSize)
+            return;
+
+        var oldest = _cacheOrder.First;
+        if (oldest is null)
+            return;
+
+        _cacheOrder.RemoveFirst();
+        _pathCache.Remove(oldest.Value);
+        _cacheNodes.Remove(oldest.Value);
     }
 
     private int GetHeuristic(int cellIndex, int goalX, int goalY)
@@ -586,19 +621,13 @@ public sealed class PathFinder
         return Math.Max(dx, dy);
     }
 
-    private static List<Point> EmptyPath => new();
-
-    private static List<Point> SinglePointPath(Point p)
-    {
-        return new List<Point> { p };
-    }
-
     /// <summary>
     /// Invalidate path cache when map topology changes (walls built/removed).
     /// </summary>
     public void InvalidatePathCache()
     {
         _pathCache.Clear();
+        _cacheNodes.Clear();
         _cacheOrder.Clear();
     }
 
@@ -689,13 +718,28 @@ public sealed class PathFinder
     /// </summary>
     public List<Point> GetPathFromDistanceGrid(Point start, int[] distanceGrid)
     {
+        var path = new List<Point>();
+        TryGetPathFromDistanceGrid(start, distanceGrid, path);
+        return path;
+    }
+
+    /// <summary>Reuses caller-owned route storage for distance-grid paths.</summary>
+    public bool TryGetPathFromDistanceGrid(Point start, int[] distanceGrid, List<Point> path)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        path.Clear();
         if (!_map.InBounds(start))
-            return EmptyPath;
+            return false;
 
         int startIdx = start.Y * _width + start.X;
         int dist = distanceGrid[startIdx];
         if (dist <= 0)
-            return dist == 0 ? SinglePointPath(start) : EmptyPath;
+        {
+            if (dist != 0)
+                return false;
+            path.Add(start);
+            return true;
+        }
 
         // Greedy descent on distance grid
         _pathBuffer.Clear();
@@ -731,9 +775,9 @@ public sealed class PathFinder
         }
 
         if (dist != 0)
-            return EmptyPath;
+            return false;
 
-        var result = new List<Point>(_pathBuffer);
-        return result;
+        path.AddRange(_pathBuffer);
+        return true;
     }
 }

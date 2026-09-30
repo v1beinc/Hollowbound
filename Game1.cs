@@ -94,7 +94,7 @@ public sealed partial class Game1 : Game
         Content.RootDirectory = "Content";
         IsMouseVisible = true;
         IsFixedTimeStep = false;
-        Window.Title = "Hollowbound - The Living Archive";
+        Window.Title = BuildInfo.WindowTitle;
         Window.AllowUserResizing = true;
         Window.ClientSizeChanged += OnClientSizeChanged;
     }

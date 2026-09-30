@@ -237,6 +237,22 @@ public static class SimulationRegressionRunner
             expanding[1].Node != sameDistanceDown || expanding[2].Node != nextRing)
             throw new SelfTestFailure("expanded resource search changed reservation, radius, or stable tie ordering");
 
+        var reusable = new List<(ResourceNode Node, int Distance)> { (blocked, 0) };
+        index.FindNearbyExpanding(new Point(10, 10), 7, reusable, minResults: 3, startRadius: 3, maxRadius: 30);
+        if (reusable.Count != 3 || reusable[0].Node != sameDistanceRight ||
+            reusable[1].Node != sameDistanceDown || reusable[2].Node != nextRing)
+            throw new SelfTestFailure("caller-buffer resource search changed results or failed to clear stale entries");
+
+        // Warm sort delegates and List capacity, then verify index queries reuse
+        // the caller buffer without allocating for every search.
+        index.FindNearbyExpanding(new Point(10, 10), 7, reusable, minResults: 3, startRadius: 3, maxRadius: 30);
+        var allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+        for (var i = 0; i < 64; i++)
+            index.FindNearbyExpanding(new Point(10, 10), 7, reusable, minResults: 3, startRadius: 3, maxRadius: 30);
+        var queryAllocatedBytes = GC.GetAllocatedBytesForCurrentThread() - allocatedBefore;
+        if (queryAllocatedBytes != 0)
+            throw new SelfTestFailure($"warmed caller-buffer resource queries allocated {queryAllocatedBytes} bytes");
+
         var depleted = new ResourceNode { Cell = new Point(24, 20), Amount = 0 };
         var regrowthIndex = new ResourceSpatialIndex();
         regrowthIndex.Rebuild(new[] { depleted });
@@ -250,7 +266,7 @@ public static class SimulationRegressionRunner
         if (regrownResults.Count != 2 || regrownResults[0].Node != depleted || regrownResults[1].Node != laterAdded)
             throw new SelfTestFailure("depleted-source regrowth or incremental node registration was not visible");
 
-        return $"expanding_radius=pass stable_order=pass reservations=pass regrowth=pass incremental_add=pass queries={index.QueryCount + regrowthIndex.QueryCount}";
+        return $"expanding_radius=pass stable_order=pass reservations=pass regrowth=pass incremental_add=pass reusable_buffer_allocated_bytes={queryAllocatedBytes} queries={index.QueryCount + regrowthIndex.QueryCount}";
     }
 
     private static string RunPathfinder()
@@ -263,6 +279,59 @@ public static class SimulationRegressionRunner
         if (openPath.Count != openDistance + 1)
             throw new SelfTestFailure($"A* open-map route was not shortest: path={openPath.Count - 1}, reference={openDistance}");
         ValidatePath(openMap, openPath, new Point(2, 3), new Point(31, 17));
+
+        var reusablePath = new List<Point> { new(0, 0) };
+        if (!openFinder.TryFindPath(new Point(2, 3), new Point(31, 17), reusablePath) ||
+            !openPath.SequenceEqual(reusablePath))
+            throw new SelfTestFailure("caller-buffer A* path differed from the allocating wrapper");
+        reusablePath.Clear();
+        if (!openFinder.TryFindPath(new Point(2, 3), new Point(31, 17), reusablePath) ||
+            !openPath.SequenceEqual(reusablePath))
+            throw new SelfTestFailure("mutating a caller-owned path corrupted the cached route");
+
+        var allocationStart = GC.GetAllocatedBytesForCurrentThread();
+        for (var i = 0; i < 128; i++)
+            if (!openFinder.TryFindPath(new Point(2, 3), new Point(31, 17), reusablePath))
+                throw new SelfTestFailure("cached caller-buffer route unexpectedly became unreachable");
+        var cachedPathAllocatedBytes = GC.GetAllocatedBytesForCurrentThread() - allocationStart;
+        if (cachedPathAllocatedBytes != 0)
+            throw new SelfTestFailure($"128 warmed caller-buffer cache hits allocated {cachedPathAllocatedBytes} bytes");
+        if (openFinder.CachedPathCount != 1 || openFinder.PathCacheOrderCount != 1)
+            throw new SelfTestFailure("repeated path-cache hits grew the LRU order structure");
+
+        var lruMap = new Map(40, 30);
+        lruMap.InitializeOpen();
+        var lruFinder = new PathFinder(lruMap);
+        var lruBuffer = new List<Point>();
+        for (var i = 0; i < 64; i++)
+        {
+            var startCell = new Point(1 + i % 30, 1 + i / 30);
+            var goalCell = new Point(39 - startCell.X, 29 - startCell.Y);
+            if (!lruFinder.TryFindPath(startCell, goalCell, lruBuffer))
+                throw new SelfTestFailure($"LRU fixture route {i} was unexpectedly unreachable");
+        }
+        if (lruFinder.CachedPathCount != 64 || lruFinder.PathCacheOrderCount != 64)
+            throw new SelfTestFailure("path cache failed to fill its fixed-size LRU window");
+        if (!lruFinder.TryFindPath(new Point(1, 1), new Point(38, 28), lruBuffer))
+            throw new SelfTestFailure("recently touched LRU route was not retained");
+        if (!lruFinder.TryFindPath(new Point(21, 3), new Point(18, 26), lruBuffer))
+            throw new SelfTestFailure("new LRU route could not be inserted");
+        var hitsBeforeRecent = lruFinder.PathCacheHits;
+        if (!lruFinder.TryFindPath(new Point(1, 1), new Point(38, 28), lruBuffer) ||
+            lruFinder.PathCacheHits != hitsBeforeRecent + 1)
+            throw new SelfTestFailure("least-recently-used eviction discarded a recently touched route");
+        var hitsBeforeEvicted = lruFinder.PathCacheHits;
+        if (!lruFinder.TryFindPath(new Point(2, 1), new Point(37, 28), lruBuffer) ||
+            lruFinder.PathCacheHits != hitsBeforeEvicted)
+            throw new SelfTestFailure("LRU eviction retained the oldest untouched route");
+        if (lruFinder.CachedPathCount != 64 || lruFinder.PathCacheOrderCount != 64)
+            throw new SelfTestFailure("path cache or LRU nodes exceeded the configured bound");
+
+        var distanceGrid = openFinder.ComputeDistanceToNearestTarget(new[] { new Point(31, 17) });
+        reusablePath.Clear();
+        if (!openFinder.TryGetPathFromDistanceGrid(new Point(2, 3), distanceGrid, reusablePath) ||
+            reusablePath.Count != openPath.Count || reusablePath[0] != new Point(2, 3) || reusablePath[^1] != new Point(31, 17))
+            throw new SelfTestFailure("caller-buffer distance-grid route was not reconstructed correctly");
 
         var corridorMap = new Map(40, 30);
         corridorMap.InitializeOpen();
@@ -291,7 +360,7 @@ public static class SimulationRegressionRunner
         if (corridorFinder.FindPath(start, goal).Count != 0)
             throw new SelfTestFailure("A* returned a path through a sealed wall barrier");
 
-        return $"open_distance={openDistance} obstacle_distance={corridorDistance} cache=pass corner_cut=prevented barrier=blocked";
+        return $"open_distance={openDistance} obstacle_distance={corridorDistance} cached_hit_allocated_bytes={cachedPathAllocatedBytes} lru=bounded caller_buffers=pass corner_cut=prevented barrier=blocked";
 
         static int ReferencePathDistance(Map map, Point from, Point to)
         {
@@ -456,7 +525,9 @@ public static class SimulationRegressionRunner
 
     private static string RunEcology()
     {
+        RunFoodReservationLifecycle();
         var feed = typeof(EmergentSimulationWorld).GetMethod("TryConsumeStoredFood", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var seekStoredFood = typeof(EmergentSimulationWorld).GetMethod("TrySetStoredFoodTarget", BindingFlags.NonPublic | BindingFlags.Instance)!;
         var resolve = typeof(EmergentSimulationWorld).GetMethod("ResolveAction", BindingFlags.NonPublic | BindingFlags.Instance)!;
         var reproduce = typeof(EmergentSimulationWorld).GetMethod("TryColonyBirth", BindingFlags.NonPublic | BindingFlags.Instance)!;
         var fixture = new EmergentSimulationWorld(817, 4).CreateSnapshot();
@@ -485,6 +556,32 @@ public static class SimulationRegressionRunner
         if (a.Energy != 40 || a.CarriedFood != 0) throw new SelfTestFailure("Storing still grants free energy");
         a.Cell = new Point(60, 40); a.Energy = 10; a.FeedingCooldown = 0;
         if ((bool)feed.Invoke(unit, new object[] { a })!) throw new SelfTestFailure("Remote reserve teleported food");
+        a.Energy = 40;
+        a.Action = AgentAction.SearchingFood;
+        a.Path.Clear();
+        a.PathIndex = 0;
+        a.FeedingCooldown = 0;
+        var stockBeforeTrip = unit.StoredFoodUnits;
+        if (!(bool)seekStoredFood.Invoke(unit, new object[] { a })!)
+            throw new SelfTestFailure("Hungry agent did not find a reachable remote reserve");
+        if (a.Action != AgentAction.GoingToStoredFood || a.FoodTargetCell != new Point(100, 61) || a.Path.Count < 2 || unit.StoredFoodUnits != stockBeforeTrip)
+            throw new SelfTestFailure($"Stored-food trip was not routed without teleporting: action={a.Action}, target={a.FoodTargetCell}, path={a.Path.Count}, stock={unit.StoredFoodUnits}");
+
+        var travellingCopy = EmergentSimulationWorld.FromSnapshot(unit.CreateSnapshot());
+        var restoredTraveller = travellingCopy.Agents.First(x => x.Id == a.Id);
+        var restoredReservations = (Dictionary<Point, int>)typeof(EmergentSimulationWorld)
+            .GetField("_storedFoodReservations", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(travellingCopy)!;
+        if (restoredTraveller.Action != AgentAction.GoingToStoredFood || restoredTraveller.FoodTargetCell != a.FoodTargetCell ||
+            restoredReservations.GetValueOrDefault(a.FoodTargetCell) != 1)
+            throw new SelfTestFailure("Stored-food route or its reservation did not survive save/load");
+        var eatenBeforeTrip = restoredTraveller.FoodEaten;
+        var learningBeforeTrip = restoredTraveller.LearningUpdates;
+        for (var step = 0; step < 500 && restoredTraveller.FoodEaten == eatenBeforeTrip; step++)
+            travellingCopy.Advance(EmergentSimulationWorld.TickLength, 1f, 1);
+        if (restoredTraveller.FoodEaten <= eatenBeforeTrip || restoredTraveller.Energy <= 40f || restoredTraveller.LearningUpdates <= learningBeforeTrip)
+            throw new SelfTestFailure("Agent did not reach, consume, and learn from the reserved colony food");
+
         a.Cell = new Point(10, 10); a.FeedingCooldown = 0;
         foreach (var p in new[] { new Point(10, 9), new Point(9, 10), new Point(11, 10), new Point(10, 11) }) unit.Map.BuildWallCell(p);
         // Remove the pile under the agent through a fixture; test an enclosed adjacent reserve.
@@ -492,6 +589,43 @@ public static class SimulationRegressionRunner
         var enclosed = EmergentSimulationWorld.FromSnapshot(blocked);
         var isolated = enclosed.Agents.First(x => x.Id == a.Id); isolated.FeedingCooldown = 0;
         if ((bool)feed.Invoke(enclosed, new object[] { isolated })!) throw new SelfTestFailure("Feeding crossed a closed wall");
+
+        var deathBase = new EmergentSimulationWorld(6151, 2).CreateSnapshot();
+        deathBase.Food.Clear();
+        deathBase.FoodStorage.Clear();
+        for (var i = 0; i < deathBase.Agents.Count; i++)
+        {
+            deathBase.Agents[i].Cell = new PointSnapshot { X = 10 + i, Y = 10 };
+            deathBase.Agents[i].Age = 100;
+            deathBase.Agents[i].Action = i == 0 ? (byte)AgentAction.SearchingFood : (byte)AgentAction.Resting;
+            deathBase.Agents[i].RestTimer = i == 0 ? 0 : 60;
+            deathBase.Agents[i].Energy = i == 0 ? 40 : 100;
+            deathBase.Agents[i].FeedingCooldown = 0;
+        }
+        deathBase.FoodStorage.Add(new StorageSnapshot { Cell = new PointSnapshot { X = 60, Y = 10 }, Amount = 40 });
+        var deathWorld = EmergentSimulationWorld.FromSnapshot(deathBase);
+        var reservationsField = typeof(EmergentSimulationWorld)
+            .GetField("_storedFoodReservations", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var traveller = deathWorld.Agents.OrderBy(x => x.Id).First();
+        var deathReservations = (Dictionary<Point, int>)reservationsField.GetValue(deathWorld)!;
+        if (!(bool)seekStoredFood.Invoke(deathWorld, new object[] { traveller })!)
+            throw new SelfTestFailure("Death fixture did not route the hungry agent to a colony reserve");
+        var deathCell = traveller.FoodTargetCell;
+        var reservedBeforeDeath = deathReservations.GetValueOrDefault(deathCell);
+        if (reservedBeforeDeath != 1)
+            throw new SelfTestFailure($"Death fixture did not hold exactly one colony reserve reservation: {reservedBeforeDeath}");
+        traveller.Energy = 0.05f;
+        traveller.FeedingCooldown = 5f;
+        deathWorld.Advance(EmergentSimulationWorld.TickLength, 1f, 1);
+        if (traveller.Alive)
+            throw new SelfTestFailure("Starving stored-food traveller survived the fatal tick");
+        var reservedAfterDeath = deathReservations.GetValueOrDefault(deathCell);
+        if (reservedAfterDeath != reservedBeforeDeath - 1)
+            throw new SelfTestFailure($"Dying traveller left a colony reserve reserved: {reservedBeforeDeath} -> {reservedAfterDeath}");
+        var afterDeath = EmergentSimulationWorld.FromSnapshot(deathWorld.CreateSnapshot());
+        var reloadedAfterDeath = (Dictionary<Point, int>)reservationsField.GetValue(afterDeath)!;
+        if (reloadedAfterDeath.GetValueOrDefault(deathCell) != reservedAfterDeath)
+            throw new SelfTestFailure("Reload did not reproduce the released colony reserve reservation");
 
         var riskBase = new EmergentSimulationWorld(54321, 80).CreateSnapshot();
         riskBase.Tick = 3000;
@@ -647,7 +781,94 @@ public static class SimulationRegressionRunner
             !double.IsFinite(profilerWorld.StepPerformance.Total.P95Milliseconds))
             throw new SelfTestFailure("Bounded step profiler did not record the expected sample window");
 
-        return $"nutrition=conserved contextual_risk={lowReserveWorld.Ecology.LastDroughtProbability:P1}>{richReserveWorld.Ecology.LastDroughtProbability:P1} drought_food_lost={phaseWorld.Ecology.DroughtFoodLost} profiler_samples={profilerWorld.StepPerformance.Total.Samples}";
+        return $"nutrition=conserved travel_death_release=released food_cancel_release=released depleted_reserve_reload=preserved contextual_risk={lowReserveWorld.Ecology.LastDroughtProbability:P1}>{richReserveWorld.Ecology.LastDroughtProbability:P1} drought_food_lost={phaseWorld.Ecology.DroughtFoodLost} profiler_samples={profilerWorld.StepPerformance.Total.Samples}";
+    }
+
+    private static void RunFoodReservationLifecycle()
+    {
+        var feed = typeof(EmergentSimulationWorld).GetMethod("TryConsumeStoredFood", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var seekFood = typeof(EmergentSimulationWorld).GetMethod("SetFoodTarget", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var seekStoredFood = typeof(EmergentSimulationWorld).GetMethod("TrySetStoredFoodTarget", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var resolve = typeof(EmergentSimulationWorld).GetMethod("ResolveAction", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var reservationsField = typeof(EmergentSimulationWorld).GetField("_storedFoodReservations", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var target = new Point(60, 10);
+
+        var cancelFixture = CreateFixture();
+        cancelFixture.Food.Add(new ResourceSnapshot { Cell = new PointSnapshot { X = target.X, Y = target.Y }, Amount = 10 });
+        cancelFixture.FoodStorage.Add(new StorageSnapshot { Cell = new PointSnapshot { X = 10, Y = 11 }, Amount = 1 });
+        var cancelWorld = EmergentSimulationWorld.FromSnapshot(cancelFixture);
+        var forager = cancelWorld.Agents.OrderBy(x => x.Id).First();
+        if (!(bool)seekFood.Invoke(cancelWorld, new object[] { forager, target })!)
+            throw new SelfTestFailure("Food-cancellation fixture failed to reserve a reachable source");
+        forager.Action = AgentAction.GoingToFood;
+        if (!cancelWorld.CreateSnapshot().Food.Single().ReservedBy.Contains(forager.Id))
+            throw new SelfTestFailure("Food-cancellation fixture held no source reservation");
+        if (!(bool)feed.Invoke(cancelWorld, new object[] { forager })! || forager.Action != AgentAction.Resting)
+            throw new SelfTestFailure("Nearby stored food did not interrupt the weak forager's trip");
+        if (forager.HasFoodTarget || cancelWorld.CreateSnapshot().Food.Single().ReservedBy.Contains(forager.Id))
+            throw new SelfTestFailure("Stored-food feeding interrupted GoingToFood without releasing its source reservation");
+
+        var depletedFixture = CreateFixture();
+        depletedFixture.Agents.OrderBy(x => x.Id).Last().Cell = new PointSnapshot { X = target.X, Y = target.Y };
+        depletedFixture.FoodStorage.Add(new StorageSnapshot { Cell = new PointSnapshot { X = target.X, Y = target.Y }, Amount = 1 });
+        var depletedWorld = EmergentSimulationWorld.FromSnapshot(depletedFixture);
+        var traveller = depletedWorld.Agents.OrderBy(x => x.Id).First();
+        var consumer = depletedWorld.Agents.OrderBy(x => x.Id).Last();
+        if (!(bool)seekStoredFood.Invoke(depletedWorld, new object[] { traveller })! ||
+            !(bool)feed.Invoke(depletedWorld, new object[] { consumer })!)
+            throw new SelfTestFailure("Depleted-reserve fixture did not route a traveller and consume the final unit");
+        var originalReservations = (Dictionary<Point, int>)reservationsField.GetValue(depletedWorld)!;
+        if (depletedWorld.CreateSnapshot().FoodStorage.Count != 0 || originalReservations.GetValueOrDefault(target) != 1)
+            throw new SelfTestFailure("Depleted-reserve fixture did not retain the pending traveller's reservation");
+
+        var restoredWorld = EmergentSimulationWorld.FromSnapshot(depletedWorld.CreateSnapshot());
+        var restoredReservations = (Dictionary<Point, int>)reservationsField.GetValue(restoredWorld)!;
+        if (restoredReservations.GetValueOrDefault(target) != originalReservations.GetValueOrDefault(target))
+            throw new SelfTestFailure("Save/load dropped the pending reservation of a temporarily depleted colony reserve");
+
+        // A delivery before the traveller's next update must not let a second
+        // agent claim the same unit only in the restored world.
+        foreach (var world in new[] { depletedWorld, restoredWorld })
+        {
+            var competitor = world.Agents.Single(x => x.Id == consumer.Id);
+            competitor.CarriedFood = 1;
+            competitor.Action = AgentAction.StoringFood;
+            resolve.Invoke(world, new object[] { competitor });
+            competitor.Energy = 40;
+            competitor.Action = AgentAction.SearchingFood;
+            if ((bool)seekStoredFood.Invoke(world, new object[] { competitor })!)
+                throw new SelfTestFailure("Replenishment allowed a second agent to claim the pending traveller's unit");
+        }
+
+        var updateState = typeof(EmergentSimulationWorld).GetMethod("UpdateAgentState", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        foreach (var world in new[] { depletedWorld, restoredWorld })
+        {
+            var pendingTraveller = world.Agents.Single(x => x.Id == traveller.Id);
+            pendingTraveller.Path.Clear();
+            updateState.Invoke(world, new object[] { pendingTraveller });
+            if (pendingTraveller.HasFoodTarget ||
+                ((Dictionary<Point, int>)reservationsField.GetValue(world)!).GetValueOrDefault(target) != 0)
+                throw new SelfTestFailure("Cancelled depleted-reserve trip did not release its reconstructed reservation");
+        }
+
+        static WorldSnapshot CreateFixture()
+        {
+            var snapshot = new EmergentSimulationWorld(6152, 2).CreateSnapshot();
+            snapshot.Food.Clear();
+            snapshot.FoodStorage.Clear();
+            foreach (var agent in snapshot.Agents)
+            {
+                agent.Cell = new PointSnapshot { X = 10, Y = 10 };
+                agent.Action = (byte)AgentAction.SearchingFood;
+                agent.Energy = 10;
+                agent.CarriedFood = 0;
+                agent.FeedingCooldown = 0;
+                agent.HasFoodTarget = false;
+                agent.Path.Clear();
+                agent.PathIndex = 0;
+            }
+            return snapshot;
+        }
     }
 
     private static string RunSettlementStability()

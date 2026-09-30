@@ -61,8 +61,26 @@ internal sealed class ResourceSpatialIndex
         int startRadius = 3,
         int maxRadius = 30)
     {
-        QueryCount++;
         var results = new List<(ResourceNode Node, int Distance)>();
+        FindNearbyExpanding(center, agentId, results, minResults, startRadius, maxRadius);
+        return results;
+    }
+
+    /// <summary>
+    /// Reuses a caller-owned buffer for hot simulation searches. The caller must
+    /// not retain or mutate the results after starting another search with the
+    /// same buffer.
+    /// </summary>
+    public void FindNearbyExpanding(
+        Point center,
+        int agentId,
+        List<(ResourceNode Node, int Distance)> results,
+        int minResults = 1,
+        int startRadius = 3,
+        int maxRadius = 30)
+    {
+        QueryCount++;
+        results.Clear();
         var maximumRadius = Math.Max(0, maxRadius);
         var radius = System.Math.Min(Math.Max(0, startRadius), maximumRadius);
         var previousRadius = -1;
@@ -78,7 +96,6 @@ internal sealed class ResourceSpatialIndex
         }
 
         SortResults(results);
-        return results;
     }
 
     private void CollectRing(

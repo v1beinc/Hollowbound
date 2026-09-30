@@ -3,9 +3,172 @@
 > Обновляется в конце каждой рабочей фазы. После сжатия контекста читать этот
 > файл ПЕРВЫМ, затем выборочно — файлы из карты ниже. Не заменяет git diff.
 
-## Текущий этап — 2026-09-28: First Cycle validation follow-up, 0.4.1-prealpha
+## Текущий этап — 2026-09-30: кодовый checkpoint 0.4.2-alpha.0
 
-Текущая версия в `main`: snapshot **v24**, analytics JSONL **schema v5**.
+Пользователь разрешил локальный commit с версией в changelog. Product version
+**0.4.2-alpha.0** синхронизирована в csproj, README, CHANGELOG и активных планах.
+Это кодовый checkpoint; **0.4.2-alpha.1** с переносимым ZIP, GUI-профилем и
+наблюдениями тестеров остаётся следующим gate. Публичного выпуска нет.
+
+Scope commit: проверенные simulation-правки доступа к запасам/резервов/
+pathfinding, regression cases, build stamp, AI-civilization планы и validation
+reports. Пользовательские `saves/` и generated logs в commit не включаются.
+При смене product-version изменена только metadata: simulation-код остаётся
+тем же, что прошёл 15/15 и camera/layout 23/23 в фазе ниже. Snapshot **v24**,
+analytics **v5**. Повторная Release-сборка версии 0.4.2-alpha.0: **0 warnings /
+0 errors**; `--version`/JSON metadata assertions **PASS**, `ecology` **1/1 PASS,
+exit 0**. Полный набор в фазе ниже относится к тому же simulation-коду, до
+смены product metadata. `git diff --check` прошёл; архивный roadmap совпадает
+с прежним tracked-файлом (с нормализацией CRLF).
+Push/tag/upload не входят в эту команду пользователя.
+
+## Предыдущий этап — 2026-09-30: интеграционное ревью baseline 0.4.2
+
+Отчёт внешней модели прочитан, тест на освобождение колониального резерва при
+смерти принят. При проверке его выводов основной агент воспроизвёл две ошибки,
+пропущенные общим набором. Полная запись: [ROOT_REVIEW_0_4_2.md](docs/validation/ROOT_REVIEW_0_4_2.md).
+Исходный [отчёт второй модели](docs/validation/BASELINE_0_4_2.md) сохранён как
+историческая проверка кода **до** исправлений основного агента.
+
+- Кормление слабого `GoingToFood` из локального запаса переключало его в отдых
+  без освобождения natural-source reservation. Теперь `ReleaseFoodReservation`
+  вызывается до смены Action.
+- `FromSnapshot` терял заявку путешественника, если склад успел опустеть.
+  Теперь резервы выводятся из живых `GoingToStoredFood`/`HasFoodTarget`, даже
+  если куча временно отсутствует. Save/load сохраняет одинаковый доступ к
+  повторно доставленной единице; отмена пути освобождает заявку.
+- Обе fixture сначала дали **FAIL, exit 1**, затем **ecology PASS, exit 0**.
+  Покрыты отмена natural-food trip, depletion/reload/replenishment и отмена
+  reconstructed reservation. Snapshot остаётся **v24**, analytics **v5**.
+- Финальный Release build: **0 warnings / 0 errors**. Основной агент запустил
+  `dotnet bin/Release/net10.0/Hollowbound.dll --self-test all` на исправленном
+  коде: **15/15 PASS, exit 0, 255,4 s**. `--test-camera-layout`: **23/23 PASS,
+  exit 0**. `v10/v11` fixtures и 12k-tick soak входят в all; multi-seed не входит.
+- Soak: **12 000 ticks, pop 412, inv_errors=0**. Responsiveness: **15 combinations,
+  0 stalls >100 ms, backlog bounded**, 2 предупреждения >12 ms. Это headless
+  проверка, не доказательство GUI FPS или x500.
+- Актуальная baseline после прогрева через `dotnet run -c Release --no-build`:
+  **126,5 / 140,5 / 124,5 TPS**, среднее **130,5**, диапазон **124,5–140,5**;
+  4000 ticks, seed 12345, initial pop 300, target x500, LOD on. Wall **28,47–32,13 s**,
+  effective speed **x12,45–x14,05**, pop 398 / births 98 / deaths 0. Все exit 0.
+  Paths 41 306 / cache hits 20 698 совпадают между запусками; это не полная
+  проверка межверсионного world state. P95 agent-loop bucket **32 ms**.
+- Отдельная серия прямого запуска DLL дала **313,2 / 313,6 / 314,8 TPS** с теми
+  же агрегатами. Причина расхождения путей запуска не изолирована; результаты
+  не смешивать и не объявлять ускорением. Будущие сравнения используют точную
+  референсную команду из ROOT_REVIEW. GUI FPS остаётся непроверенным.
+- Raw stdout: `%TEMP%\Hollowbound-review-20260930\self-test-all.log` и
+  `benchmark-sdk-1.log`/`benchmark-sdk-2.log`/`benchmark-sdk-3.log`.
+  `git diff --check` прошёл. Старая серия 80,4 / 107,4 / 90,9 TPS — история.
+
+Следующий gate: GUI-профиль и ручная сессия; переносимый Windows ZIP со шрифтом,
+лицензиями/manifest, запуск без SDK, настоящие legacy saves/recovery и feedback.
+2h/8h фон и multi-seed на исправленной версии здесь ещё не проверены.
+Версия продукта остаётся **0.4.1-prealpha**; 0.4.2 не выпущена. Пользовательские
+saves, commit/push и магазины не изменялись.
+
+## Предыдущий этап — 2026-09-30: build identity, подготовка 0.4.2
+
+Пользователь передал большую задачу simulation baseline другой модели вручную.
+Встроенный субагент остановлен; не возобновлять и не создавать замену.
+Задание: `docs/agent-tasks/BASELINE_0_4_2_PROMPT.md`. Внешняя модель владеет
+`Simulation/` и `docs/validation/BASELINE_0_4_2.md`; основной агент — BuildInfo,
+Program, Game1, csproj и корневые документы. Не запускать конкурирующие сборки
+или benchmark и не считать внешнюю задачу завершённой без её отчёта/ревью.
+
+Меньший срез основного агента: `BuildInfo.cs`, `Program.cs`, `Game1.cs`,
+`Hollowbound.csproj` — общая product version для CLI и заголовка окна.
+
+- Default version **0.4.1-prealpha**; `-p:Version=...` задаёт candidate version.
+- `--version` и `--build-info` не создают мир/окно; читают assembly metadata.
+  Stamp: source commit, nullable dirty, configuration/SDK/target/RID,
+  snapshot **v24**, analytics **v5**. Git опрашивается только при сборке.
+- Недоступные source metadata дают unknown/null; dirty preview не подменяет
+  reproducible release и не содержит patch manifest или ruleset hash.
+- Release build на SDK **10.0.401**: **0 warnings / 0 errors**.
+  Обе CLI-команды завершились с exit 0; JSON assertions подтвердили версию,
+  HEAD `8994c41559e4e8b21bfd13105d82fb53ba447cdc`, dirty=true и версии контрактов.
+- Windows apphost EXE проверен через launcher с redirected stdout/stderr и
+  ожиданием завершения: `--build-info` дал правильный JSON, exit 0. Прямой
+  вызов GUI EXE в PowerShell без launcher не дал stdout/`$LASTEXITCODE`;
+  это не проверка exit code. `git diff --check` прошёл.
+- MSBuild probe `GetAssemblyAttributes` подтвердил `Version=0.4.2-alpha.1`
+  override и unknown-source fallback при отключённых source-control queries.
+  Это проверка metadata без выпуска новой версии или publish.
+- GUI-заголовок реализован, но реальное окно не запускалось. Полные simulation
+  tests и benchmark относятся к задаче внешней модели и здесь не заявляются.
+
+Следующий gate: принять отчёт внешней модели и проверить её diff; затем GUI,
+переносимый Windows ZIP/шрифт/manifest, запуск без SDK и наблюдения тестеров.
+0.4.2 не объявлена готовой. Пользовательские saves, commit/push и магазины
+этим срезом не затрагивались.
+
+## Предыдущий этап — 2026-09-30: реконструкция логики AI-цивилизации
+
+Пользователь утвердил дополнение документов под новое направление: автономный AI
+создаёт производственную инфраструктуру, организации, экономику, коллективные
+знания и империи; игрок видит большой прогресс, оставляет мир развиваться и
+управляет на макроуровне через аналитику, приоритеты, инвестиции и отношения.
+
+- [VISION.md](VISION.md): принятый вектор, игровые системы и границы 1.0.
+- [TECH_STACK.md](TECH_STACK.md): C#/.NET 10/MonoGame, Utility AI + bounded GOAP,
+  детерминированная экономика, память/вычислительные узлы, фон и условный ML.
+- [ROADMAP.md](ROADMAP.md): активные версии 0.4.2 → 0.5 → 0.6 → 0.7 → 0.8 →
+  0.9 → 0.10 → 1.0 RC → 1.0 с действиями и критериями готовности.
+- [RELEASE_PLAN.md](RELEASE_PLAN.md): reproducible Windows package, проверки,
+  GitHub/itch.io/Steam, official sources, rollout и поддержка.
+- Прежний roadmap сохранён в `docs/archive/ROADMAP_BEFORE_CIVILIZATION_2026-09-30.md`;
+  его сроки/статусы не являются активным планом. README и CHANGELOG синхронизированы.
+
+Это пакет документации: новые экономические/AI-системы ещё не реализованы.
+Инженерная база остаётся 0.4.1-prealpha, snapshot v24, analytics schema v5.
+Ближайшая кодовая фаза — 0.4.2: ревью текущего diff, актуальная validation,
+GUI/performance baseline и переносимая alpha; затем один контур Power & Industry.
+Численные acceptance-цели в новых документах являются предложенными критериями,
+а не полученными результатами. Build/self-tests в рамках этого пакета документов
+не запускались. Проверены 8 активных Markdown-документов и 24 локальные ссылки:
+ошибок нет, code fences согласованы; архивный roadmap совпадает по содержимому
+с исходным tracked-файлом. `git diff --check -- '*.md'` прошёл.
+
+Код, пользовательские saves и предыдущие локальные simulation-правки сохраняются.
+Commit/push, выпуск артефакта и загрузка в магазины этим пакетом не выполняются.
+
+## Предыдущий инженерный этап — 2026-09-29: First Cycle validation follow-up, 0.4.1-prealpha
+
+База: `main` / `8994c41`; рабочее дерево содержит локальные изменения без commit/push.
+Snapshot **v24**, analytics JSONL **schema v5**.
+
+### Последний локальный пакет — доступ к запасам еды и pathfinding
+
+- Активный голодный агент может идти по проходимому маршруту к локальному
+  запасу; резерв порции восстанавливается из save/load. Успех и неудача похода
+  отражаются в обучении агента и объяснении его действия.
+- Поиск еды переиспользует буферы вместо двух временных списков на каждое
+  решение. Прогретый resource-index search: 64 запроса, **0 B allocations**.
+- A* теперь заполняет caller-owned маршрут; игровой путь, поиск через distance
+  grid и проверка связности проходов переиспользуют буферы. LRU заменён с очереди
+  дублирующихся ключей на строго ограниченный список из 64 узлов: прежняя очередь
+  могла расти без ограничения на cache-hit.
+- Последний benchmark `seed=12345, ticks=4000, x500, population=300`: **31.5 TPS**,
+  итоговая population 398, deaths 0; path requests 41,306, cache hits 20,698.
+  Замеры той же нагрузки ранее колебались от 28.6 до 68.2 TPS, поэтому прирост
+  скорости не подтверждён и не заявляется. Agent-loop p95 около 128 ms в headless.
+- Responsive test после pathfinding changes: **15 combinations, 0 stalls >100 ms,
+  backlog bounded**; при population около 300 и запросе x500 измерено около x6.2.
+- Текущие проверки: build **0 warnings / 0 errors**; `pathfinder`, `resource-index`,
+  `ecology`, `continuation` и `multi-seed` **PASS**; multi-seed 100/100 без
+  вымирания. `--self-test all` после этого пакета не запускался; последний полный
+  результат 15/15 относится к состоянию до этих локальных изменений.
+- Новый benchmark JSONL: `%TEMP%\Hollowbound\logs\simulation-20260929-171424736.jsonl`;
+  analyzer сообщил 137 корректных записей, 0 повреждённых строк.
+- Локальные изменения также включают незакоммиченные работы по экологии/питанию
+  и resource buffers из предыдущего этапа. `saves/` — существующие пользовательские
+  данные, не изменялись. GitHub не менялся.
+
+**Следующий gate:** получить GUI-замер на реальном запуске и отдельно профилировать
+дорогие категории маршрутов; не считать x500 фактической скоростью и не объявлять
+TPS-ускорение до повторяемых сравнительных замеров. Перед публикацией проверить
+весь staged diff и только по отдельному разрешению делать commit/push.
 
 - **Скорость симуляции:** deterministic A* с Chebyshev-эвристикой и стабильным
   tie-break; resource search по чанкам 8×8; индекс ресурсов пополняется
